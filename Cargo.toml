@@ -1,0 +1,122 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/av-core",
+    "crates/av-events",
+    "crates/av-atif",
+    "crates/av-receipts",
+    "crates/av-state",
+    "crates/av-bridge",
+    "crates/av-identity",
+    "crates/av-compress",
+    "crates/av-loopdetect",
+    "crates/av-sandbox",
+    "crates/av-harness",
+    "crates/av-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.94"
+license = "Apache-2.0"
+repository = "https://github.com/AgentVisorAI/agentvisor"
+homepage = "https://agentvisorai.me/"
+documentation = "https://agentvisorai.me/api/"
+# `keywords` and `categories` are inherited by every workspace crate
+# via `keywords.workspace = true` / `categories.workspace = true`.
+# crates.io caps at 5 keywords / 5 categories.
+keywords = ["ai", "agents", "audit", "atif", "ocsf"]
+categories = ["command-line-utilities", "web-programming::http-server", "asynchronous"]
+
+[workspace.dependencies]
+av-core = { path = "crates/av-core", version = "0.1.0" }
+av-events = { path = "crates/av-events", version = "0.1.0" }
+av-atif = { path = "crates/av-atif", version = "0.1.0" }
+av-receipts = { path = "crates/av-receipts", version = "0.1.0" }
+av-state = { path = "crates/av-state", version = "0.1.0" }
+av-bridge = { path = "crates/av-bridge", version = "0.1.0" }
+av-identity = { path = "crates/av-identity", version = "0.1.0" }
+av-compress = { path = "crates/av-compress", version = "0.1.0" }
+av-loopdetect = { path = "crates/av-loopdetect", version = "0.1.0" }
+av-sandbox = { path = "crates/av-sandbox", version = "0.1.0" }
+av-harness = { path = "crates/av-harness", version = "0.1.0" }
+
+tokio = { version = "1.47", features = ["full"] }
+axum = { version = "0.8", features = ["macros"] }
+hyper = { version = "1.7", features = ["full"] }
+hyper-util = { version = "0.1", features = ["server", "http2", "tokio", "service"] }
+tower = { version = "0.5", features = ["util", "limit", "timeout"] }
+futures = "0.3"
+serde = { version = "1.0", features = ["derive"] }
+# float_roundtrip is REQUIRED for RFC 8785 correctness: without it serde_json
+# parses floats at reduced precision and canonical hashes differ from other
+# JCS implementations (verified by the RFC Appendix vectors in av-receipts).
+serde_json = { version = "1.0", features = ["preserve_order", "float_roundtrip"] }
+serde_yaml = "0.9"
+toml = "1.1"
+thiserror = "2.0"
+anyhow = "1.0"
+# Correctly-rounded shortest float digits for RFC 8785 (already in-tree via serde_json).
+ryu = "1.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+uuid = { version = "1.18", features = ["v7", "v4", "serde"] }
+ed25519-dalek = { version = "3.0", features = ["rand_core", "pkcs8", "pem", "zeroize"] }
+zeroize = { version = "1.8", features = ["derive"] }
+sha2 = "0.11"
+hmac = "0.13"
+hex = "0.4"
+base64 = "0.23"
+rand = "0.10"
+jsonwebtoken = { version = "11.0", default-features = false, features = ["use_pem", "rust_crypto"] }
+jsonschema = "0.49"
+dashmap = "6.1"
+parking_lot = "0.12"
+r2d2 = "0.8"
+clap = { version = "4.5", features = ["derive"] }
+rpassword = "7.4"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream", "http2"] }
+wasmtime = { version = "47", default-features = false, features = ["runtime", "cranelift", "wat"] }
+criterion = { version = "0.8", features = ["html_reports"] }
+proptest = "1.6"
+tempfile = "3.14"
+object_store = { version = "0.14", default-features = false }
+url = "2.5"
+rdkafka = { version = "0.39", default-features = false, features = ["tokio", "cmake-build", "ssl-vendored"] }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
+unused_must_use = "deny"
+
+[workspace.lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+dbg_macro = "deny"
+todo = "deny"
+unimplemented = "deny"
+indexing_slicing = "warn"
+# Checked arithmetic is enforced by construction in budget/monetary code (av-state);
+# blanket-warning every u64 counter/time op only produces noise.
+arithmetic_side_effects = "allow"
+cast_possible_truncation = "warn"
+must_use_candidate = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+module_name_repetitions = "allow"
+
+[profile.release]
+# LTO is deliberately OFF: with `lto = "thin"` (and even `fat` for the
+# harness SLA binary) the librdkafka admin path deterministically hit
+# the 10 s connector timeout against a live broker — every release-mode
+# `KafkaBus::provision` failed while debug builds passed, so the defect
+# was invisible to unit tests and static review (found by the live
+# backend campaign; rustc 1.97.1, aarch64). Release SLA numbers with
+# LTO off remain well inside the documented gates (hot p95 31 µs).
+lto = false
+codegen-units = 1
+
+[profile.bench]
+debug = true

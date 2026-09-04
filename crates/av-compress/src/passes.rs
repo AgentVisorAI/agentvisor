@@ -1,0 +1,1333 @@
+//! Compression passes over OpenAI-shape chat payloads.
+
+use av_core::tokens::approx_tokens;
+use serde_json::{json, Value};
+
+/// Tuning knobs (config-file surface; defaults follow the brief).
+#[derive(Debug, Clone)]
+pub struct CompressionConfig {
+    /// Never touch the last N messages (short-term memory preservation).
+    pub keep_tail: usize,
+    /// Tool outputs older than the tail are stubbed when longer than this
+    /// many approximate tokens.
+    pub tool_output_stub_threshold: u64,
+    /// Also collapse exact-duplicate user/assistant messages
+    /// (tool messages are never collapsed).
+    pub collapse_duplicates: bool,
+    /// Normalize whitespace inside JSON-looking tool/assistant string content.
+    pub normalize_json: bool,
+    /// Only bother when the payload reaches at least this many approximate
+    /// tokens (compressing tiny payloads wastes hot-path time).
+    pub min_tokens_to_engage: u64,
+    /// Enable audited middle-history stubbing when other passes cannot reach
+    /// the target on very large histories. Only engages when the payload
+    /// reaches at least 50 000 approximate tokens (hardcoded floor; trumps
+    /// `min_tokens_to_engage` for this pass).
+    pub summarize_middle: bool,
+    /// Minimum target reduction ratio times 1000.
+    pub target_reduction_millis: u64,
+}
+
+impl Default for CompressionConfig {
+    fn default() -> Self {
+        Self {
+            keep_tail: 8,
+            tool_output_stub_threshold: 128,
+            collapse_duplicates: true,
+            normalize_json: true,
+            min_tokens_to_engage: 512,
+            summarize_middle: true,
+            target_reduction_millis: 300,
+        }
+    }
+}
+
+/// Result of a compression run.
+#[derive(Debug, Clone)]
+pub struct CompressionOutcome {
+    /// The (possibly) compressed payload.
+    pub payload: Value,
+    /// Approximate tokens before.
+    pub tokens_before: u64,
+    /// Approximate tokens after.
+    pub tokens_after: u64,
+    /// Whether any pass modified the payload.
+    pub changed: bool,
+}
+
+impl CompressionOutcome {
+    /// Pruned token count.
+    pub fn pruned_tokens(&self) -> u64 {
+        self.tokens_before.saturating_sub(self.tokens_after)
+    }
+
+    /// Reduction ratio ×1000 (350 = 35.0 %), integer for JCS-exact metrics.
+    pub fn pruning_ratio_millis(&self) -> u64 {
+        if self.tokens_before == 0 {
+            return 0;
+        }
+        self.pruned_tokens().saturating_mul(1000) / self.tokens_before
+    }
+}
+
+/// Compress a chat payload. Non-chat or unparsable payloads are returned
+/// unchanged (`changed = false`) — this function must never fail the hot path.
+pub fn compress(payload: &Value, cfg: &CompressionConfig) -> CompressionOutcome {
+    let tokens_before = approx_tokens(&payload.to_string());
+    let Some(messages) = payload.get("messages").and_then(Value::as_array) else {
+        return CompressionOutcome {
+            payload: payload.clone(),
+            tokens_before,
+            tokens_after: tokens_before,
+            changed: false,
+        };
+    };
+    if tokens_before < cfg.min_tokens_to_engage || messages.is_empty() {
+        return CompressionOutcome {
+            payload: payload.clone(),
+            tokens_before,
+            tokens_after: tokens_before,
+            changed: false,
+        };
+    }
+
+    let mut out = messages.clone();
+    let tail_start = out.len().saturating_sub(cfg.keep_tail);
+
+    let mut changed = false;
+    // Normalization must run BEFORE the duplicate-collapse passes:
+    // it rewrites assistant/tool content (JSON minification), so two
+    // semantically identical messages that differ only in formatting
+    // become byte-identical only AFTER this pass. With dedupe first,
+    // run 1 kept both, normalized them equal, and run 2 then collapsed
+    // one — violating invariant #4, `compress(compress(x)) ==
+    // compress(x)` (lib.rs). Normalize-first is stable: run 2's
+    // normalize is a no-op on already-minified content, so every later
+    // pass sees the same input it saw in run 1's output.
+    if cfg.normalize_json {
+        changed |= normalize_json_content(&mut out, tail_start);
+    }
+    changed |= collapse_duplicate_system(&mut out, tail_start);
+    if cfg.collapse_duplicates {
+        changed |= collapse_duplicate_messages(&mut out, tail_start);
+    }
+    changed |= stub_stale_tool_outputs(&mut out, tail_start, cfg.tool_output_stub_threshold);
+    if cfg.summarize_middle && tokens_before >= 50_000 {
+        changed |= stub_middle_to_target(
+            payload,
+            &mut out,
+            tail_start,
+            tokens_before,
+            cfg.target_reduction_millis,
+        );
+    }
+
+    if !changed {
+        return CompressionOutcome {
+            payload: payload.clone(),
+            tokens_before,
+            tokens_after: tokens_before,
+            changed: false,
+        };
+    }
+    let mut new_payload = payload.clone();
+    if let Some(obj) = new_payload.as_object_mut() {
+        obj.insert("messages".to_owned(), Value::Array(out));
+    }
+    let tokens_after = approx_tokens(&new_payload.to_string());
+    // Guard: a pass must never grow the payload; if it somehow did, keep the original.
+    if tokens_after > tokens_before {
+        return CompressionOutcome {
+            payload: payload.clone(),
+            tokens_before,
+            tokens_after: tokens_before,
+            changed: false,
+        };
+    }
+    CompressionOutcome {
+        payload: new_payload,
+        tokens_before,
+        tokens_after,
+        changed: true,
+    }
+}
+
+fn stub_middle_to_target(
+    payload: &Value,
+    messages: &mut [Value],
+    tail_start: usize,
+    tokens_before: u64,
+    target_reduction_millis: u64,
+) -> bool {
+    // Bound the idempotence scan to the middle range only. A legitimate tail
+    // message that happens to quote the marker (a follow-up assistant reply
+    // summarizing a prior compression, or user-controlled content) would
+    // otherwise permanently disable this pass on that conversation.
+    //
+    // TODO(compression-marker): the marker itself is still an
+    // unauthenticated literal substring, so a hostile MIDDLE-range
+    // message can still spoof it and skip stubbing of surrounding
+    // messages. Fixing that requires switching to a keyed marker
+    // (HMAC over prior content) or an out-of-band per-payload
+    // flag — both are larger refactors.
+    //
+    // Tracked as a known limitation (see the
+    // compression-marker entry in SECURITY-AUDIT.md). Attack requires
+    // an already-compromised prior turn (either an operator who
+    // pasted attacker content verbatim, or a system prompt
+    // hardening bypass) — real-world exploitability is bounded to
+    // "attacker who already has message-content control can force
+    // compression pass to skip." A keyed-marker
+    // scheme remains future work, currently unscheduled.
+    let scan_end = tail_start.min(messages.len());
+    // The prior check refused to run a
+    // second pass if ANY pre-tail message content contained the
+    // literal substring "reason: middle history]" — but a
+    // user/assistant message that legitimately quotes that phrase
+    // (or a compromised prior turn that includes it as free text)
+    // could silently disable compression. Narrow the check to
+    // exactly what the marker produces: content must START with
+    // "[pruned:" AND contain the marker tail. A user quoting the
+    // phrase in free text no longer matches (their content will
+    // start with their own words, not "[pruned:"). This is not
+    // the full keyed-marker fix (a known limitation) —
+    // but the spoofing surface shrinks from "any message contains
+    // the substring" to "any message perfectly mimics the marker
+    // prefix + tail." Realistic user text does not shape like a
+    // machine-emitted `[pruned: N tokens, sha256:HEX, reason: middle
+    // history]`.
+    if messages.get(..scan_end).into_iter().flatten().any(|message| {
+        msg_content_str(message).is_some_and(|content| {
+            content.starts_with("[pruned:") && content.contains("reason: middle history]")
+        })
+    }) {
+        return false;
+    }
+    let target_tokens =
+        tokens_before.saturating_mul(1000u64.saturating_sub(target_reduction_millis.min(1000))) / 1000;
+    let mut changed = false;
+    // The prior loop called
+    // `payload_tokens_with_messages(payload, messages)` on every
+    // iteration — each call clones the entire payload AND the
+    // entire messages Vec, then serializes to string. For a 4 MiB
+    // payload with N messages that's O(N²) work AND O(N) transient
+    // allocations per iteration. Instead track a running
+    // `current_tokens` counter that is decremented by the message's
+    // pre-stub token count and incremented by the stub's on each
+    // successful substitution. `payload_tokens_with_messages` is
+    // still called once at loop entry to seed the counter (the
+    // envelope's token count includes non-messages fields like
+    // `model` and `stream`, which the incremental delta preserves).
+    let mut current_tokens = payload_tokens_with_messages(payload, messages);
+    for index in 0..tail_start {
+        if current_tokens <= target_tokens {
+            break;
+        }
+        let Some(message) = messages.get_mut(index) else {
+            continue;
+        };
+        let role = msg_role(message);
+        if role == "system" || role == "tool" || message.get("tool_calls").is_some() {
+            continue;
+        }
+        let Some(content) = msg_content_str(message) else {
+            continue;
+        };
+        if content.starts_with("[pruned:") {
+            continue;
+        }
+        let tokens = approx_tokens(content);
+        if tokens < 32 {
+            continue;
+        }
+        // The running counter was seeded from the
+        // SERIALIZED payload (JSON-escaped: `\n` → two chars, `"` →
+        // `\"`), but decrements used raw-content tokens. Raw ≤ escaped
+        // always, so the loop over-stated remaining tokens and kept
+        // stubbing past the target — destroying messages that should
+        // have survived on code/JSON-heavy content. Measure both the
+        // removed content and the added stub in serialized units.
+        let serialized_tokens =
+            approx_tokens(&serde_json::to_string(&Value::String(content.to_owned())).unwrap_or_default());
+        let digest = av_core::digest::sha256_hex(content.as_bytes());
+        let stub_content = format!("[pruned: {tokens} tokens, sha256:{digest}, reason: middle history]");
+        let stub_serialized_tokens =
+            approx_tokens(&serde_json::to_string(&Value::String(stub_content.clone())).unwrap_or_default());
+        if let Some(object) = message.as_object_mut() {
+            object.insert("content".to_owned(), Value::String(stub_content));
+            // Update the running counter: original message content
+            // contributed `serialized_tokens`, new stub contributes
+            // `stub_serialized_tokens`. Everything else in the payload
+            // envelope is unchanged.
+            current_tokens = current_tokens
+                .saturating_sub(serialized_tokens)
+                .saturating_add(stub_serialized_tokens);
+            changed = true;
+        }
+    }
+    changed
+}
+
+fn payload_tokens_with_messages(payload: &Value, messages: &[Value]) -> u64 {
+    let mut value = payload.clone();
+    if let Some(object) = value.as_object_mut() {
+        object.insert("messages".to_owned(), Value::Array(messages.to_vec()));
+    }
+    approx_tokens(&value.to_string())
+}
+
+fn msg_role(m: &Value) -> &str {
+    m.get("role").and_then(Value::as_str).unwrap_or("")
+}
+
+fn msg_content_str(m: &Value) -> Option<&str> {
+    m.get("content").and_then(Value::as_str)
+}
+
+/// Keep the first system message; collapse later *identical* system messages
+/// (duplicate re-injection is a common agent-framework bug).
+fn collapse_duplicate_system(messages: &mut [Value], tail_start: usize) -> bool {
+    let Some(first_system) = messages.iter().position(|m| msg_role(m) == "system") else {
+        return false;
+    };
+    let reference = messages.get(first_system).cloned();
+    let Some(reference) = reference else { return false };
+    let mut changed = false;
+    for (i, m) in messages.iter_mut().enumerate() {
+        if i <= first_system || i >= tail_start {
+            continue;
+        }
+        if msg_role(m) == "system" && *m == reference {
+            let tokens = approx_tokens(&reference.to_string());
+            let stub = audit_stub("duplicate system message", tokens, &reference);
+            // Stub only when it shrinks the
+            // message — a short duplicate would otherwise GROW the
+            // payload and trip the outer revert-guard into cancelling
+            // the whole compression outcome.
+            if approx_tokens(&stub) >= tokens {
+                continue;
+            }
+            *m = json!({
+                "role": "system",
+                "content": stub,
+            });
+            changed = true;
+        }
+    }
+    changed
+}
+
+/// Collapse exact-duplicate user/assistant messages outside the tail
+/// (identical retries / framework echoes).
+///
+/// A `HashSet` keyed by content hash replaced
+/// the O(n²) `Vec::contains`, hardened twofold:
+///
+/// 1. **Eligibility**: only messages whose ONLY fields are `role` and
+///    `content` participate. The previous `(role, content)` key
+///    collapsed messages that differed in `name` (multi-participant),
+///    `refusal`, legacy `function_call`, or `audio` — permanently
+///    destroying the distinguishing field (e.g. WHICH named user said
+///    "approve"), violating the crate's "never semantically
+///    destructive" invariant.
+/// 2. **Verification**: the 64-bit hash is a fast filter only; a hash
+///    hit is confirmed with full `Value` equality against the first
+///    occurrence before stubbing. `DefaultHasher` is unkeyed, so a
+///    collision is offline-searchable by anyone who controls message
+///    content — treating a collision as equality silently destroyed a
+///    non-duplicate.
+///
+/// Also applies the stub-size floor: a duplicate is
+/// only stubbed when the stub is actually smaller, so collapsing many
+/// short duplicates can no longer GROW the payload and trip the outer
+/// revert-guard into cancelling all compression for the conversation.
+fn collapse_duplicate_messages(messages: &mut [Value], tail_start: usize) -> bool {
+    use std::collections::HashMap;
+    use std::hash::{DefaultHasher, Hash, Hasher};
+    // hash → index of first occurrence, for equality confirmation.
+    let mut seen: HashMap<u64, usize> = HashMap::new();
+    let mut changed = false;
+    for i in 0..tail_start.min(messages.len()) {
+        let Some(m) = messages.get(i) else { continue };
+        let role = msg_role(m).to_owned();
+        if role != "user" && role != "assistant" {
+            continue;
+        }
+        // Only collapse messages carrying NOTHING beyond role+content —
+        // any extra field (name, refusal, function_call, audio, …) is
+        // semantically distinguishing and must survive verbatim.
+        let only_role_and_content = m
+            .as_object()
+            .is_some_and(|obj| obj.len() == 2 && obj.contains_key("role") && obj.contains_key("content"));
+        if !only_role_and_content {
+            continue;
+        }
+        let Some(content) = msg_content_str(m) else {
+            continue;
+        };
+        // Never re-collapse audit stubs (stub-of-stub would break idempotence).
+        if content.starts_with("[pruned:") {
+            continue;
+        }
+        let mut hasher = DefaultHasher::new();
+        role.hash(&mut hasher);
+        content.hash(&mut hasher);
+        let key = hasher.finish();
+        match seen.get(&key) {
+            None => {
+                seen.insert(key, i);
+            }
+            Some(&first_index) => {
+                // Confirm with real equality — a hash collision must
+                // never destroy a non-duplicate.
+                let is_true_duplicate = messages
+                    .get(first_index)
+                    .is_some_and(|first| messages.get(i).is_some_and(|current| first == current));
+                if !is_true_duplicate {
+                    continue;
+                }
+                let Some(m) = messages.get_mut(i) else { continue };
+                let tokens = approx_tokens(content_of(m).unwrap_or_default());
+                let stub = audit_stub("duplicate message", tokens, m);
+                // Stub-size floor: replacing a 1-token "ok" with a
+                // ~30-token stub grows the payload.
+                if approx_tokens(&stub) >= tokens {
+                    continue;
+                }
+                *m = json!({ "role": role, "content": stub });
+                changed = true;
+            }
+        }
+    }
+    changed
+}
+
+/// Owned-content helper for the post-borrow stub construction above.
+fn content_of(m: &Value) -> Option<&str> {
+    m.get("content").and_then(Value::as_str)
+}
+
+/// Replace large, stale tool outputs with audit stubs (the brief's "stale tool
+/// responses"). The `tool_call_id` linkage field is preserved so the
+/// conversation graph stays intact.
+fn stub_stale_tool_outputs(messages: &mut [Value], tail_start: usize, threshold: u64) -> bool {
+    let mut changed = false;
+    for (i, m) in messages.iter_mut().enumerate() {
+        if i >= tail_start {
+            break;
+        }
+        if msg_role(m) != "tool" {
+            continue;
+        }
+        let Some(content) = msg_content_str(m) else {
+            continue;
+        };
+        if content.starts_with("[pruned:") {
+            continue; // already stubbed — idempotence
+        }
+        let tokens = approx_tokens(content);
+        if tokens <= threshold {
+            continue;
+        }
+        let digest = av_core::digest::sha256_hex(content.as_bytes());
+        let stub = format!("[pruned: {tokens} tokens, sha256:{digest}]");
+        if let Some(obj) = m.as_object_mut() {
+            obj.insert("content".to_owned(), Value::String(stub));
+            changed = true;
+        }
+    }
+    changed
+}
+
+/// Minify JSON-formatted string content (strip redundant JSON formatting per
+/// the brief) outside the tail.
+fn normalize_json_content(messages: &mut [Value], tail_start: usize) -> bool {
+    let mut changed = false;
+    for (i, m) in messages.iter_mut().enumerate() {
+        if i >= tail_start {
+            break;
+        }
+        let role = msg_role(m);
+        if role != "tool" && role != "assistant" {
+            continue;
+        }
+        let Some(content) = msg_content_str(m) else {
+            continue;
+        };
+        let trimmed = content.trim_start();
+        if !(trimmed.starts_with('{') || trimmed.starts_with('[')) {
+            continue;
+        }
+        let Ok(parsed) = serde_json::from_str::<Value>(content) else {
+            continue;
+        };
+        let Ok(minified) = serde_json::to_string(&parsed) else {
+            continue;
+        };
+        // The round-trip through `Value` is
+        // lossy for (a) integers outside i64/u64 range — parsed as
+        // f64 and re-serialized with precision loss (128-bit IDs,
+        // large monetary integers common in tool outputs) — and (b)
+        // duplicate keys, collapsed last-wins. Both silently corrupt
+        // tool data the model then reasons over, violating the
+        // "never semantically destructive" invariant. Detect by
+        // re-parsing the minified form and requiring Value-equality
+        // AND matching numeric-literal token streams; skip the pass
+        // for content that does not round-trip exactly.
+        let round_trips = serde_json::from_str::<Value>(&minified)
+            .map(|reparsed| reparsed == parsed)
+            .unwrap_or(false)
+            && numeric_literals(content) == numeric_literals(&minified)
+            && !has_duplicate_keys(content);
+        if !round_trips {
+            continue;
+        }
+        if minified.len() < content.len() {
+            if let Some(obj) = m.as_object_mut() {
+                obj.insert("content".to_owned(), Value::String(minified));
+                changed = true;
+            }
+        }
+    }
+    changed
+}
+
+fn audit_stub(reason: &str, tokens: u64, original: &Value) -> String {
+    let digest = av_core::digest::sha256_hex(original.to_string().as_bytes());
+    format!("[pruned: {tokens} tokens ({reason}), sha256:{digest}]")
+}
+
+/// Minification-proof helpers: a single-pass JSON lexer extracting the
+/// ordered numeric-literal tokens and the object-key count from RAW
+/// text (no Value round-trip). Used to prove a minification did not
+/// mutate numeric representations (bigint precision loss) or collapse
+/// duplicate keys.
+fn numeric_literals(raw: &str) -> Vec<String> {
+    lex_json(raw).0
+}
+
+fn has_duplicate_keys(raw: &str) -> bool {
+    // If minification would drop keys, the raw text's key count exceeds
+    // the reparse's. Compare against the canonical no-dup serialization.
+    let Ok(parsed) = serde_json::from_str::<Value>(raw) else {
+        return true; // unparseable — treat conservatively
+    };
+    let Ok(minified) = serde_json::to_string(&parsed) else {
+        return true;
+    };
+    lex_json(raw).1 != lex_json(&minified).1
+}
+
+/// Returns (ordered numeric literals, object-key count).
+fn lex_json(raw: &str) -> (Vec<String>, usize) {
+    let mut numbers = Vec::new();
+    let mut key_count = 0usize;
+    let bytes = raw.as_bytes();
+    let mut i = 0;
+    while let Some(&byte) = bytes.get(i) {
+        match byte {
+            b'"' => {
+                // Skip string, handling escapes; then check for a
+                // following ':' (object key).
+                i += 1;
+                while let Some(&inner) = bytes.get(i) {
+                    match inner {
+                        b'\\' => i += 2,
+                        b'"' => {
+                            i += 1;
+                            break;
+                        }
+                        _ => i += 1,
+                    }
+                }
+                let mut j = i;
+                while bytes.get(j).is_some_and(u8::is_ascii_whitespace) {
+                    j += 1;
+                }
+                if bytes.get(j) == Some(&b':') {
+                    key_count += 1;
+                }
+            }
+            b'-' | b'0'..=b'9' => {
+                let start = i;
+                i += 1;
+                while bytes
+                    .get(i)
+                    .is_some_and(|b| matches!(b, b'0'..=b'9' | b'.' | b'e' | b'E' | b'+' | b'-'))
+                {
+                    i += 1;
+                }
+                if let Some(token) = raw.get(start..i) {
+                    numbers.push(token.to_owned());
+                }
+            }
+            _ => i += 1,
+        }
+    }
+    (numbers, key_count)
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )]
+
+    use super::*;
+
+    /// Register pass 30 finding — LIMITS.md claimed the stub target
+    /// ratio was 50% ("half the pre-compression count") but the code
+    /// default has always been `target_reduction_millis: 300`, meaning
+    /// a 30% reduction (target = 70% of pre-compression tokens). An
+    /// operator sizing prompt budget by the doc would over-provision
+    /// by 40 percentage points. Pin the actual default to the number
+    /// LIMITS.md documents so changing either without matching the
+    /// other trips CI. Register item 25 named doc/code drift as the
+    /// most reliable failure mode.
+    #[test]
+    fn limits_md_names_the_actual_compression_defaults() {
+        let doc = include_str!("../../../docs/reference/LIMITS.md");
+        let cfg = CompressionConfig::default();
+
+        assert_eq!(
+            cfg.min_tokens_to_engage, 512,
+            "engagement floor default changed; update LIMITS.md"
+        );
+        assert!(
+            doc.contains("512 tokens"),
+            "LIMITS.md must name the 512-token engagement floor"
+        );
+
+        assert_eq!(
+            cfg.target_reduction_millis, 300,
+            "stub target reduction default changed from 300 (30%); update LIMITS.md"
+        );
+        // 300 per-mille = 30% reduction. LIMITS.md must state THIS
+        // number, not the historical "50% / half" figure that the
+        // code never actually implemented (found live pass 30).
+        assert!(
+            doc.contains("30% reduction") && doc.contains("70%"),
+            "LIMITS.md's stub-target row must name the actual behavior \
+             (30% reduction, 70% remaining), not the historical 50%/half claim"
+        );
+
+        // Also pin the 50k floor for summarize_middle so a rename
+        // there doesn't silently orphan the doc entry.
+        assert!(
+            doc.contains("50k prompt tokens"),
+            "LIMITS.md must name the 50k summarize_middle engagement threshold"
+        );
+    }
+
+    /// The duplicate-key minification-skip guard is the semantic-
+    /// destruction protection of `normalize_json_content`: minifying
+    /// through `Value` collapses duplicate keys last-wins, so content
+    /// with duplicates must be left VERBATIM. Pin both the guard and
+    /// the end-to-end effect (a mutant forcing `has_duplicate_keys`
+    /// to `false` previously survived).
+    #[test]
+    fn duplicate_key_json_content_is_never_minified() {
+        assert!(has_duplicate_keys(r#"{"a": 1, "a": 2}"#));
+        assert!(has_duplicate_keys(r#"{"outer": {"k": 1, "k": 2}}"#));
+        assert!(!has_duplicate_keys(r#"{"a": 1, "b": {"a": 2}}"#));
+        let dup = "{\"a\":  1,   \"a\":  2,   \"pad\": \"padding padding padding\"}";
+        let mut messages = vec![
+            serde_json::json!({"role": "assistant", "content": dup}),
+            serde_json::json!({"role": "user", "content": "tail"}),
+        ];
+        let changed = normalize_json_content(&mut messages, 1);
+        assert!(!changed, "duplicate-key JSON must be left verbatim");
+        assert_eq!(messages[0]["content"].as_str().unwrap(), dup);
+    }
+
+    fn engage_all() -> CompressionConfig {
+        CompressionConfig {
+            min_tokens_to_engage: 0,
+            ..CompressionConfig::default()
+        }
+    }
+
+    fn payload(messages: Vec<Value>) -> Value {
+        json!({"model": "gpt-4o", "messages": messages, "stream": true})
+    }
+
+    /// Mutation-run hardening (round 7): `collapse_duplicate_system`'s
+    /// role-AND-equality conjunction — an `&&`→`||` mutant survived,
+    /// i.e. no test pinned that a DIFFERENT second system message is
+    /// never stubbed. Stubbing a distinct system message destroys
+    /// instructions the model was meant to see: the exact
+    /// "semantically destructive" class the pass documentation forbids.
+    #[test]
+    fn distinct_system_messages_are_never_stubbed() {
+        let first = "you are a careful assistant ".repeat(40);
+        let second = "different critical instructions entirely ".repeat(40);
+        let mut messages = vec![
+            json!({"role": "system", "content": first}),
+            json!({"role": "system", "content": second}),
+        ];
+        for _ in 0..9 {
+            messages.push(json!({"role": "assistant", "content": "tail ".repeat(50)}));
+        }
+        let out = compress(&payload(messages), &engage_all());
+        let out_messages = out.payload["messages"].as_array().unwrap();
+        assert_eq!(
+            out_messages[1]["content"].as_str().unwrap(),
+            second,
+            "a distinct system message must survive verbatim"
+        );
+    }
+
+    /// Mutation-run hardening (round 7): duplicate USER messages must
+    /// collapse (the `role != \"user\"` guard had a surviving `!=`→`==`
+    /// mutant — the only duplicate-collapse coverage used assistant
+    /// shapes).
+    #[test]
+    fn duplicate_user_messages_collapse_to_a_stub() {
+        let text = "please retry the same command again ".repeat(40);
+        let reply = "acknowledged, retrying the command now ".repeat(40);
+        let mut messages = vec![
+            json!({"role": "user", "content": text}),
+            json!({"role": "user", "content": text}),
+            json!({"role": "assistant", "content": reply}),
+            json!({"role": "assistant", "content": reply}),
+        ];
+        for _ in 0..9 {
+            messages.push(json!({"role": "assistant", "content": "tail ".repeat(50)}));
+        }
+        let out = compress(&payload(messages), &engage_all());
+        let out_messages = out.payload["messages"].as_array().unwrap();
+        assert_eq!(out_messages[0]["content"].as_str().unwrap(), text);
+        assert!(
+            out_messages[1]["content"]
+                .as_str()
+                .unwrap()
+                .starts_with("[pruned:"),
+            "the duplicate user message must be stubbed"
+        );
+        // The assistant arm of the role filter must collapse too (its
+        // half of the `!=` conjunction had a surviving mutant).
+        assert_eq!(out_messages[2]["content"].as_str().unwrap(), reply);
+        assert!(
+            out_messages[3]["content"]
+                .as_str()
+                .unwrap()
+                .starts_with("[pruned:"),
+            "the duplicate assistant message must be stubbed"
+        );
+    }
+
+    /// Mutation-run hardening (round 7): the escape-handling arms of
+    /// `lex_json` had surviving mutants — no test lexed content whose
+    /// strings carry `\"` escapes. The guard must count keys and
+    /// numeric literals correctly through escaped quotes, or dup-key
+    /// content could minify (semantic destruction) and bigint tokens
+    /// could silently mutate.
+    #[test]
+    fn lex_json_handles_escaped_quotes() {
+        // The escaped quote must not terminate the string: the `:9`
+        // inside is string content, not a numeric literal, and the
+        // whole thing is ONE key.
+        let (numbers, keys) = lex_json(r#"{"a\":9":1}"#);
+        assert_eq!(numbers, vec!["1".to_owned()]);
+        assert_eq!(keys, 1);
+        // Structurally rich exact-tuple pin: multiple keys, an escaped
+        // quote inside a key, numbers in values and arrays, and a
+        // digit+colon INSIDE string content — any index-arithmetic slip
+        // in the lexer shifts this tuple.
+        let (numbers, keys) = lex_json(r#"{"x":12,"y\":":3.5e2,"n:1":"t","z":[7,-8]}"#);
+        assert_eq!(
+            numbers,
+            vec![
+                "12".to_owned(),
+                "3.5e2".to_owned(),
+                "7".to_owned(),
+                "-8".to_owned()
+            ]
+        );
+        assert_eq!(keys, 4);
+        // Escape NOT adjacent to a quote (`\n` inside a key whose
+        // content carries `:7`): index-arithmetic slips in the escape
+        // arm re-lex this into phantom numeric literals.
+        let (numbers, keys) = lex_json(r#"{"a\nb:7":1}"#);
+        assert_eq!(numbers, vec!["1".to_owned()]);
+        assert_eq!(keys, 1);
+        // Whitespace between the closing quote and the colon exercises
+        // the lookahead scan; a slip there miscounts keys and turns
+        // every spaced object into a phantom duplicate-key verdict.
+        assert!(!has_duplicate_keys(r#"{"k" : 1, "j" : 2}"#));
+        let (_, keys) = lex_json(r#"{"k" : 1, "j" : 2}"#);
+        assert_eq!(keys, 2);
+        // Duplicate keys that contain escaped quotes must still be
+        // detected (and therefore left unminified end-to-end).
+        assert!(has_duplicate_keys(r#"{"k\"":1, "k\"":2}"#));
+        assert!(!has_duplicate_keys(r#"{"k\"":1, "j\"":2}"#));
+        let dup = r#"{"k\"": 1,  "k\"": 2,  "pad": "padding padding padding"}"#;
+        let mut messages = vec![
+            json!({"role": "assistant", "content": dup}),
+            json!({"role": "user", "content": "tail"}),
+        ];
+        assert!(
+            !normalize_json_content(&mut messages, 1),
+            "escaped-quote duplicate keys must be left verbatim"
+        );
+    }
+
+    /// Mutation-run hardening (round 7): a payload whose token count
+    /// is EXACTLY `min_tokens_to_engage` engages (`<` skip, not `<=` —
+    /// a surviving boundary mutant showed the threshold unpinned).
+    #[test]
+    fn payload_exactly_at_engage_threshold_engages() {
+        let text = "identical duplicate content here ".repeat(40);
+        let mut messages = vec![
+            json!({"role": "user", "content": text}),
+            json!({"role": "user", "content": text}),
+        ];
+        for _ in 0..9 {
+            messages.push(json!({"role": "assistant", "content": "tail ".repeat(50)}));
+        }
+        let value = payload(messages);
+        let exact = av_core::tokens::approx_tokens(&value.to_string());
+        let cfg = CompressionConfig {
+            min_tokens_to_engage: exact,
+            ..CompressionConfig::default()
+        };
+        let out = compress(&value, &cfg);
+        assert!(
+            out.changed,
+            "a payload exactly at the engage threshold must be compressed"
+        );
+    }
+
+    /// Mutation-run hardening (round 7): the middle-stub TARGET
+    /// arithmetic (`before * (1000 - millis) / 1000`) had a surviving
+    /// `/`→`%` mutant — nothing pinned that the pass stops at the
+    /// configured reduction instead of stubbing every eligible middle
+    /// message to the floor.
+    #[test]
+    fn middle_stubbing_stops_at_the_configured_target() {
+        // 40 distinct ~1400-token user messages (~56k tokens total,
+        // past the 50k middle-stub engage floor) + tail: the default
+        // 300‰ target needs only a fraction of them stubbed.
+        let mut messages = Vec::new();
+        for i in 0..40 {
+            messages.push(json!({
+                "role": "user",
+                "content": format!("distinct message number {i} {}", "filler ".repeat(700)),
+            }));
+        }
+        for _ in 0..9 {
+            messages.push(json!({"role": "assistant", "content": "tail"}));
+        }
+        let out = compress(&payload(messages), &engage_all());
+        let out_messages = out.payload["messages"].as_array().unwrap();
+        let stubbed = out_messages
+            .iter()
+            .filter(|m| {
+                m["content"]
+                    .as_str()
+                    .is_some_and(|content| content.starts_with("[pruned:"))
+            })
+            .count();
+        assert!(stubbed > 0, "the target requires SOME middle stubbing");
+        assert!(
+            stubbed < 40,
+            "stubbing must stop at the 300 per-mille target, not raze the whole middle ({stubbed}/40 stubbed)"
+        );
+    }
+
+    #[test]
+    fn non_chat_payload_untouched() {
+        let v = json!({"not_messages": [1, 2, 3]});
+        let out = compress(&v, &engage_all());
+        assert!(!out.changed);
+        assert_eq!(out.payload, v);
+    }
+
+    #[test]
+    fn small_payload_not_engaged() {
+        let v = payload(vec![json!({"role": "user", "content": "hi"})]);
+        let out = compress(&v, &CompressionConfig::default());
+        assert!(!out.changed, "512-token floor must skip tiny payloads");
+    }
+
+    /// Messages carrying fields beyond role+content
+    /// (`name`, `refusal`, `function_call`, …) are semantically distinct
+    /// even when role+content match — they must never be collapsed.
+    #[test]
+    fn named_messages_are_never_collapsed_as_duplicates() {
+        let text = "approve ".repeat(80);
+        let mut messages = vec![
+            json!({"role": "user", "name": "alice", "content": text}),
+            json!({"role": "user", "name": "bob", "content": text}),
+            json!({"role": "user", "content": text}),
+            json!({"role": "user", "content": text}),
+        ];
+        // Pad past keep_tail (default 8) so the head messages are
+        // outside the protected tail and dedupe scans them.
+        for _ in 0..9 {
+            messages.push(json!({"role": "assistant", "content": "tail ".repeat(50)}));
+        }
+        let out = compress(&payload(messages), &engage_all());
+        let out_messages = out.payload["messages"].as_array().unwrap();
+        assert_eq!(out_messages[0]["name"], "alice");
+        assert_eq!(out_messages[1]["name"], "bob");
+        assert!(
+            !out_messages[1]["content"]
+                .as_str()
+                .unwrap()
+                .starts_with("[pruned:"),
+            "named message collapsed despite distinguishing field"
+        );
+        assert!(
+            out_messages[3]["content"]
+                .as_str()
+                .unwrap()
+                .starts_with("[pruned:"),
+            "plain role+content duplicate should still collapse"
+        );
+    }
+
+    /// Collapsing a short duplicate must not grow
+    /// the payload — the stub floor skips them.
+    #[test]
+    fn short_duplicates_are_not_stubbed_into_growth() {
+        let mut messages = vec![
+            json!({"role": "user", "content": "ok"}),
+            json!({"role": "user", "content": "ok"}),
+        ];
+        for _ in 0..9 {
+            messages.push(json!({"role": "assistant", "content": "tail ".repeat(60)}));
+        }
+        let out = compress(&payload(messages), &engage_all());
+        let out_messages = out.payload["messages"].as_array().unwrap();
+        assert_eq!(
+            out_messages[1]["content"], "ok",
+            "a 1-token duplicate must survive (stub would be ~30 tokens)"
+        );
+    }
+
+    /// Minification must not mutate numeric
+    /// representations (bigint precision loss) or collapse duplicate
+    /// keys inside tool output.
+    #[test]
+    fn normalize_json_preserves_bigints_and_duplicate_keys() {
+        let bigint_content = format!(
+            "{{\n  \"id\": 123456789012345678901234567890,\n  \"note\": \"{}\"\n}}",
+            "x".repeat(200)
+        );
+        let dup_content = format!(
+            "{{\n  \"k\": 1,\n  \"k\": 2,\n  \"note\": \"{}\"\n}}",
+            "y".repeat(200)
+        );
+        let plain_content = format!("{{\n  \"count\": 42,\n  \"note\": \"{}\"\n}}", "z".repeat(200));
+        let mut messages = vec![
+            json!({"role": "tool", "tool_call_id": "1", "content": bigint_content}),
+            json!({"role": "tool", "tool_call_id": "2", "content": dup_content}),
+            json!({"role": "tool", "tool_call_id": "3", "content": plain_content}),
+        ];
+        for _ in 0..9 {
+            messages.push(json!({"role": "assistant", "content": "tail ".repeat(60)}));
+        }
+        let out = compress(&payload(messages), &engage_all());
+        let out_messages = out.payload["messages"].as_array().unwrap();
+        let first = out_messages[0]["content"].as_str().unwrap();
+        assert!(
+            first.contains("123456789012345678901234567890"),
+            "bigint must survive verbatim, got: {first}"
+        );
+        let second = out_messages[1]["content"].as_str().unwrap();
+        assert!(
+            second.matches("\"k\"").count() == 2,
+            "duplicate keys must survive verbatim, got: {second}"
+        );
+        let third = out_messages[2]["content"].as_str().unwrap();
+        assert!(
+            !third.contains('\n'),
+            "cleanly-roundtripping JSON should still be minified, got: {third}"
+        );
+    }
+
+    #[test]
+    fn duplicate_system_collapsed_first_kept() {
+        let sys = json!({"role": "system", "content": "You are a helpful agent. ".repeat(20)});
+        let mut msgs = vec![sys.clone()];
+        for i in 0..10 {
+            msgs.push(json!({"role": "user", "content": format!("q{i}")}));
+            msgs.push(sys.clone());
+        }
+        let out = compress(&payload(msgs), &engage_all());
+        assert!(out.changed);
+        let result = out.payload["messages"].as_array().unwrap();
+        // First system byte-identical.
+        assert_eq!(result[0], sys, "first system message must be untouched");
+        // Later duplicates (outside tail) stubbed.
+        let stubbed = result
+            .iter()
+            .skip(1)
+            .filter(|m| {
+                msg_role(m) == "system" && msg_content_str(m).is_some_and(|c| c.starts_with("[pruned:"))
+            })
+            .count();
+        assert!(stubbed > 0, "no duplicate system messages were stubbed");
+        assert!(out.tokens_after < out.tokens_before);
+    }
+
+    #[test]
+    fn stale_tool_outputs_stubbed_with_digest_tail_preserved() {
+        let big = "x ".repeat(4000);
+        let mut msgs = vec![json!({"role": "system", "content": "sys"})];
+        for i in 0..6 {
+            msgs.push(json!({"role": "assistant", "content": null, "tool_calls": [{"id": format!("c{i}"), "type": "function", "function": {"name": "search", "arguments": "{}"}}]}));
+            msgs.push(json!({"role": "tool", "tool_call_id": format!("c{i}"), "content": big}));
+        }
+        let tail_tool = json!({"role": "tool", "tool_call_id": "c5", "content": big});
+        msgs.push(tail_tool.clone());
+        let out = compress(&payload(msgs), &engage_all());
+        assert!(out.changed);
+        let result = out.payload["messages"].as_array().unwrap();
+        // Early tool output stubbed with digest of the original.
+        let first_tool = result.iter().find(|m| msg_role(m) == "tool").unwrap();
+        let stub = msg_content_str(first_tool).unwrap();
+        assert!(stub.starts_with("[pruned:"), "{stub}");
+        let expected_digest = av_core::digest::sha256_hex(big.as_bytes());
+        assert!(
+            stub.contains(&expected_digest),
+            "audit digest must reference the original"
+        );
+        // tool_call_id linkage preserved.
+        assert!(first_tool.get("tool_call_id").is_some());
+        // Tail messages byte-identical.
+        assert_eq!(*result.last().unwrap(), tail_tool);
+    }
+
+    /// Mutation-run hardening: `collapse_duplicate_messages` had no
+    /// behavioral coverage at all — replacing the whole function with a
+    /// constant `true`/`false` survived the suite. Pin its contract:
+    /// exact user/assistant duplicates outside the tail collapse to audit
+    /// stubs, the first occurrence and the tail stay byte-identical, and
+    /// tool-role messages are never collapsed even when identical.
+    #[test]
+    fn duplicate_user_and_assistant_messages_collapse_outside_tail() {
+        let dup_user = json!({"role": "user", "content": "please retry the exact same thing ".repeat(8)});
+        let dup_tool = json!({"role": "tool", "tool_call_id": "c1", "content": "identical tool payload"});
+        let mut msgs = vec![json!({"role": "system", "content": "sys"})];
+        for _ in 0..6 {
+            msgs.push(dup_user.clone());
+            msgs.push(dup_tool.clone());
+        }
+        let tail = json!({"role": "user", "content": "fresh tail question"});
+        msgs.push(tail.clone());
+        let out = compress(&payload(msgs.clone()), &engage_all());
+        assert!(out.changed);
+        let result = out.payload["messages"].as_array().unwrap();
+        // First occurrence byte-identical.
+        let first_user = result.iter().find(|m| msg_role(m) == "user").unwrap();
+        assert_eq!(*first_user, dup_user, "first duplicate must be kept verbatim");
+        // Later duplicates outside the tail become audit stubs that keep
+        // the role and reference the original via digest.
+        let expected_digest = av_core::digest::sha256_hex(dup_user.to_string().as_bytes());
+        let stubbed = result
+            .iter()
+            .filter(|m| {
+                msg_role(m) == "user"
+                    && msg_content_str(m)
+                        .is_some_and(|c| c.starts_with("[pruned:") && c.contains(&expected_digest))
+            })
+            .count();
+        assert!(stubbed >= 1, "no duplicate user message was stubbed: {result:?}");
+        // Tool messages are never collapsed, even when identical.
+        assert!(
+            result
+                .iter()
+                .filter(|m| msg_role(m) == "tool")
+                .all(|m| *m == dup_tool),
+            "tool messages must never be collapsed by the duplicate pass"
+        );
+        // Tail untouched.
+        assert_eq!(*result.last().unwrap(), tail);
+        // And the whole pass is disable-able: collapse_duplicates=false
+        // leaves every user duplicate verbatim.
+        let cfg = CompressionConfig {
+            collapse_duplicates: false,
+            normalize_json: false,
+            summarize_middle: false,
+            tool_output_stub_threshold: u64::MAX,
+            ..engage_all()
+        };
+        let untouched = compress(&payload(msgs), &cfg);
+        let kept = untouched.payload["messages"].as_array().unwrap();
+        assert!(
+            kept.iter().filter(|m| **m == dup_user).count() == 6,
+            "collapse_duplicates=false must keep every duplicate verbatim"
+        );
+    }
+
+    /// Mutation-run hardening: the middle-history stub pass's role
+    /// exclusions (`role == "system" || role == "tool" || tool_calls`)
+    /// and its `tokens < 32` floor survived operator mutations. Pin them:
+    /// system/tool/tool-calls/small messages in the middle range survive
+    /// verbatim while large plain messages are stubbed, and stubbing
+    /// stops once the target reduction is reached.
+    #[test]
+    fn middle_stub_skips_protected_roles_and_small_messages() {
+        let big = "long analysis paragraph ".repeat(600); // well past 50k total below
+        let protected_system = json!({"role": "system", "content": big.clone()});
+        let protected_tool = json!({"role": "tool", "tool_call_id": "c1", "content": big.clone()});
+        let protected_calls = json!({"role": "assistant", "content": big.clone(),
+            "tool_calls": [{"id": "c1", "type": "function", "function": {"name": "f", "arguments": "{}"}}]});
+        let small = json!({"role": "user", "content": "tiny"});
+        let mut msgs = vec![
+            protected_system.clone(),
+            protected_tool.clone(),
+            protected_calls.clone(),
+            small.clone(),
+        ];
+        for _ in 0..40 {
+            msgs.push(json!({"role": "assistant", "content": big.clone()}));
+        }
+        let cfg = CompressionConfig {
+            collapse_duplicates: false,
+            normalize_json: false,
+            tool_output_stub_threshold: u64::MAX,
+            ..engage_all()
+        };
+        let out = compress(&payload(msgs), &cfg);
+        assert!(out.changed, "large history must engage the middle stub pass");
+        let result = out.payload["messages"].as_array().unwrap();
+        assert_eq!(result[0], protected_system, "system messages must survive");
+        assert_eq!(result[1], protected_tool, "tool messages must survive");
+        assert_eq!(result[2], protected_calls, "tool-call carriers must survive");
+        assert_eq!(result[3], small, "sub-32-token messages must survive");
+        let stubbed = result
+            .iter()
+            .filter(|m| msg_content_str(m).is_some_and(|c| c.contains("reason: middle history]")))
+            .count();
+        assert!(stubbed > 0, "large plain middle messages must be stubbed");
+        // The pass stops at the target: with the default 30% target on a
+        // uniform history it must NOT stub everything eligible.
+        let eligible = result
+            .iter()
+            .filter(|m| msg_role(m) == "assistant" && m.get("tool_calls").is_none())
+            .count();
+        assert!(
+            stubbed < eligible,
+            "stubbing must stop at the target reduction, not consume the whole middle"
+        );
+        // Reduction reached the configured target ratio.
+        assert!(
+            out.pruning_ratio_millis() >= cfg.target_reduction_millis,
+            "reduction {} must reach the target {}",
+            out.pruning_ratio_millis(),
+            cfg.target_reduction_millis
+        );
+    }
+
+    /// Regression guard: a message that legitimately QUOTES the
+    /// marker tail phrase in free text must NOT disable the middle
+    /// pass. An earlier check refused to run if any pre-tail message
+    /// content contained the literal substring; the fix
+    /// narrowed the check to require the message to also START WITH
+    /// `[pruned:`. A user turn that says `"the log said 'reason:
+    /// middle history]'"` is normal text; compression must still run.
+    #[test]
+    fn quoted_marker_phrase_in_normal_text_does_not_disable_compression() {
+        let mut msgs = vec![
+            json!({"role": "system", "content": "sys"}),
+            // The quoted-marker phrase — no `[pruned:` prefix, so
+            // the narrowed check should NOT match it.
+            json!({"role": "user", "content": "the log said 'reason: middle history]' earlier"}),
+        ];
+        // Make each assistant message unique so the duplicate pass
+        // doesn't consume them before the middle pass runs. The
+        // middle pass has a 50_000 token entry threshold; size each
+        // message to comfortably clear it in aggregate.
+        for i in 0..80 {
+            msgs.push(json!({
+                "role": "assistant",
+                "content": format!("unique analysis paragraph {i} {}", "detail ".repeat(1200))
+            }));
+        }
+        // Disable the duplicate + normalize passes so we specifically
+        // exercise the middle-pass kill-switch narrowing.
+        let cfg = CompressionConfig {
+            collapse_duplicates: false,
+            normalize_json: false,
+            tool_output_stub_threshold: u64::MAX,
+            ..engage_all()
+        };
+        let out = compress(&payload(msgs), &cfg);
+        assert!(
+            out.changed,
+            "middle pass must run despite the user quoting the marker phrase in free text"
+        );
+        let result = out.payload["messages"].as_array().unwrap();
+        // The quoted message is preserved verbatim (it's below the
+        // 32-token floor and it's a `user` role — no pass touches it).
+        assert_eq!(
+            msg_content_str(&result[1]).unwrap(),
+            "the log said 'reason: middle history]' earlier",
+            "the quoted user message must be preserved verbatim"
+        );
+        // Middle-pass stubs are produced for the large assistant
+        // messages.
+        let stubbed = result
+            .iter()
+            .filter(|m| {
+                msg_content_str(m)
+                    .is_some_and(|c| c.starts_with("[pruned:") && c.contains("reason: middle history]"))
+            })
+            .count();
+        assert!(
+            stubbed > 0,
+            "large plain middle messages must still be stubbed, got {result:#?}"
+        );
+    }
+
+    #[test]
+    fn json_content_minified() {
+        let pretty = serde_json::to_string_pretty(&json!({"a": [1, 2, 3], "b": {"c": "d"}})).unwrap();
+        let mut msgs = vec![json!({"role": "system", "content": "sys"})];
+        for i in 0..12 {
+            msgs.push(json!({"role": "user", "content": format!("q{i} {}", "pad ".repeat(50))}));
+            msgs.push(json!({"role": "assistant", "content": pretty.clone()}));
+        }
+        let out = compress(&payload(msgs), &engage_all());
+        assert!(out.changed);
+        let result = out.payload["messages"].as_array().unwrap();
+        let minified = result
+            .iter()
+            .skip(1)
+            .find(|m| msg_role(m) == "assistant")
+            .unwrap();
+        let c = msg_content_str(minified).unwrap();
+        assert!(!c.contains('\n'), "not minified: {c}");
+        assert_eq!(
+            serde_json::from_str::<Value>(c).unwrap(),
+            json!({"a": [1,2,3], "b": {"c": "d"}})
+        );
+    }
+
+    #[test]
+    fn idempotent() {
+        let big = "data ".repeat(2000);
+        let mut msgs = vec![json!({"role": "system", "content": "sys"})];
+        for i in 0..10 {
+            msgs.push(json!({"role": "user", "content": "same question"}));
+            msgs.push(json!({"role": "tool", "tool_call_id": format!("c{i}"), "content": big}));
+        }
+        let once = compress(&payload(msgs), &engage_all());
+        assert!(once.changed);
+        let twice = compress(&once.payload, &engage_all());
+        assert_eq!(once.payload, twice.payload, "compress must be idempotent");
+        assert_eq!(twice.tokens_after, once.tokens_after);
+    }
+
+    #[test]
+    fn output_never_larger() {
+        let out = compress(
+            &payload(vec![json!({"role": "user", "content": "abc ".repeat(500)})]),
+            &engage_all(),
+        );
+        assert!(out.tokens_after <= out.tokens_before);
+    }
+
+    /// Success criterion R7/R24: ≥ 30 % reduction on a ≥ 50 k-token agent history.
+    #[test]
+    fn fifty_k_token_history_reduced_at_least_30_percent() {
+        let sys = json!({"role": "system", "content": format!("You are an autonomous agent. {}", "Rules. ".repeat(100))});
+        let tool_blob = serde_json::to_string_pretty(
+            &json!({"rows": (0..200).map(|i| json!({"id": i, "name": format!("row-{i}"), "status": "ok", "payload": "z".repeat(40)})).collect::<Vec<_>>()}),
+        )
+        .unwrap();
+        let mut msgs = vec![sys.clone()];
+        for i in 0..40 {
+            msgs.push(sys.clone()); // framework re-injects the system prompt (real-world pattern)
+            msgs.push(json!({"role": "user", "content": format!("step {i}: continue the plan")}));
+            msgs.push(json!({"role": "assistant", "content": null, "tool_calls": [{"id": format!("c{i}"), "type": "function", "function": {"name": "db_read", "arguments": "{\"q\": 1}"}}]}));
+            msgs.push(json!({"role": "tool", "tool_call_id": format!("c{i}"), "content": tool_blob}));
+        }
+        let p = payload(msgs);
+        let out = compress(&p, &CompressionConfig::default());
+        assert!(
+            out.tokens_before >= 50_000,
+            "corpus too small: {}",
+            out.tokens_before
+        );
+        let ratio = out.pruning_ratio_millis();
+        assert!(ratio >= 300, "reduction {}.{}% < 30%", ratio / 10, ratio % 10);
+        // Metric names mirror ATIF (Module C requirement).
+        assert!(out.pruned_tokens() > 0);
+    }
+
+    #[test]
+    fn unique_fifty_k_history_reaches_target_without_touching_tail() {
+        let mut messages = vec![json!({"role": "system", "content": "stable system prompt"})];
+        for index in 0..80 {
+            messages.push(json!({
+                "role": if index % 2 == 0 { "user" } else { "assistant" },
+                "content": format!(
+                    "unique-{index} {}",
+                    (0..900)
+                        .map(|word| format!("token-{index}-{word}"))
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                )
+            }));
+        }
+        let input = payload(messages);
+        let original_tail = input["messages"].as_array().unwrap()[73..].to_vec();
+        let output = compress(&input, &CompressionConfig::default());
+        assert!(output.tokens_before >= 50_000);
+        assert!(output.pruning_ratio_millis() >= 300);
+        assert_eq!(
+            &output.payload["messages"].as_array().unwrap()[73..],
+            original_tail.as_slice()
+        );
+        assert_eq!(
+            compress(&output.payload, &CompressionConfig::default()).payload,
+            output.payload
+        );
+    }
+
+    #[test]
+    fn tool_calls_messages_never_collapsed() {
+        // Messages carrying tool_calls must never be deduplicated even if identical.
+        let call = json!({"role": "assistant", "content": null, "tool_calls": [{"id": "c1", "type": "function", "function": {"name": "f", "arguments": "{}"}}]});
+        let mut msgs = vec![json!({"role": "system", "content": "s"})];
+        for _ in 0..12 {
+            msgs.push(call.clone());
+            msgs.push(json!({"role": "user", "content": "pad ".repeat(100)}));
+        }
+        let out = compress(&payload(msgs), &engage_all());
+        let result = out.payload["messages"].as_array().unwrap();
+        let intact = result.iter().filter(|m| **m == call).count();
+        assert_eq!(intact, 12, "tool_calls messages must survive verbatim");
+    }
+}
+
+#[cfg(test)]
+mod ratio_tests {
+    /// Mutation-run hardening: pin the R7 metric arithmetic —
+    /// `/` -> `%`/`*` in `pruning_ratio_millis` would corrupt the
+    /// pruning-ratio field that mirrors ATIF metrics.
+    #[test]
+    fn pruning_ratio_millis_is_exact() {
+        let outcome = super::CompressionOutcome {
+            payload: serde_json::Value::Null,
+            tokens_before: 1000,
+            tokens_after: 650,
+            changed: true,
+        };
+        assert_eq!(outcome.pruning_ratio_millis(), 350, "350 = 35.0%");
+        let zero = super::CompressionOutcome {
+            payload: serde_json::Value::Null,
+            tokens_before: 0,
+            tokens_after: 0,
+            changed: false,
+        };
+        assert_eq!(zero.pruning_ratio_millis(), 0, "0/0 guard");
+    }
+}

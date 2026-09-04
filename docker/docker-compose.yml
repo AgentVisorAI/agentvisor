@@ -1,0 +1,251 @@
+services:
+  agentvisor-ai:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    image: agentvisor-ai:local
+    container_name: agentvisor-ai
+    ports:
+      # Round-15 F7: bind to 127.0.0.1 explicitly. Docker's default
+      # (`"8484:8484"`) means `0.0.0.0:8484`, which reaches the host
+      # from any network interface including LAN and — with a
+      # misconfigured firewall — the public internet. Combined with
+      # the shipped default `require_identity = false` in
+      # `config/harness.docker.toml`, an anonymous internet peer
+      # could otherwise exercise `/v1/chat/completions` against the
+      # operator's upstream credentials. If remote access IS
+      # intended, change this mapping AND set
+      # `require_identity = true` at the same step.
+      - "127.0.0.1:8484:8484"
+    # Docker's default stop_grace_period is 10 s — far shorter than the
+    # harness's four shutdown phases (HTTP drain, worker wait_idle,
+    # finalize_sessions, telemetry flush). This service loads
+    # config/harness.docker.toml, which sets shutdown_drain_timeout_s
+    # = 110 (to fit the 300 s upstream_read_timeout_s streaming
+    # window). Total worst-case budget: 110 (HTTP drain) + 30 (worker
+    # wait_idle) + 30 (finalize_sessions) + 5 (OTel) = 175 s. Without
+    # this override, or with the previous 120 s value which the
+    # earlier comment miscomputed as "30 s each × 3 + 5 = 95 s",
+    # docker stop / docker compose down sent SIGKILL mid-finalize,
+    # dropping receipts and truncating ATIF trajectories. 180 s
+    # leaves a small safety margin.
+    stop_grace_period: 180s
+    # Round-24 F2: pair the systemd-side Restart=on-failure hardening
+    # (round-19 F7) with a compose-side policy. Without this, a single
+    # OOMKill leaves agentvisor-ai Exited with no healthcheck consulted
+    # and no alert path. Use `unless-stopped` so `docker compose down`
+    # still works predictably (as opposed to `always`).
+    restart: unless-stopped
+    # Match the Kubernetes securityContext: no fresh privileges after fork,
+    # drop every Linux capability, and cap process/memory footprint so a
+    # runaway or compromised worker cannot starve the host.
+    security_opt:
+      - "no-new-privileges:true"
+    cap_drop:
+      - ALL
+    pids_limit: 4096
+    read_only: false # /app/data and /app/spool are writable named volumes
+    environment:
+      RUST_LOG: info
+      AV_CONFIG: /app/config/harness.docker.toml
+      # Round-16 F3: the signing seed IS the receipt trust anchor.
+      # Living on the shared `bridge-data` named volume meant any
+      # co-scheduled container mounting `-v bridge-data:/x` could
+      # read it — no mode enforcement, no Secret gating. The
+      # docker-compose posture claimed to use a mode:0400 secret,
+      # but that secret was only wired for the identity HMAC.
+      # Now it's a first-class docker secret alongside the HMAC.
+      AV_SIGNING_SEED_FILE: /run/secrets/signing_seed
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://vector:4318
+      OTEL_EXPORTER_OTLP_PROTOCOL: http/protobuf
+    volumes:
+      - bridge-data:/app/data
+      - atif-spool:/app/spool
+    secrets:
+      # Long-form: pin the mount to the container's non-root uid so a
+      # co-scheduled exec session cannot read the HMAC via the world bit
+      # of the default 0444 mount.
+      - source: identity_hmac
+        target: identity_hmac
+        uid: "65532"
+        gid: "65532"
+        mode: 0400
+      # Round-16 F3: signing seed pinned identically. Populate the
+      # secret at compose-up time via the secrets: block at the
+      # bottom of this file (or `docker secret create`).
+      - source: signing_seed
+        target: signing_seed
+        uid: "65532"
+        gid: "65532"
+        mode: 0400
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    healthcheck:
+      # Hardcode the URL rather than relying on `avctl health`'s default
+      # matching whatever `listen` is in `config/harness.docker.toml`.
+      # A silent drift between the two used to make the healthcheck
+      # report *green* against the wrong endpoint (round-11 F8) — the
+      # `listen` port changing without the CLI default updating still
+      # returned 200 from a stale sidecar or an unrelated in-container
+      # service. Probe /readyz, not the /health constant: a full disk
+      # keeps /health green while every request 503s — readiness's
+      # spool WRITABILITY probe is what flips on that incident.
+      test: ["CMD", "avctl", "health", "--url", "http://127.0.0.1:8484/readyz"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    depends_on:
+      redpanda:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      qdrant:
+        condition: service_healthy
+
+  redpanda:
+    image: redpandadata/redpanda:v25.2.5
+    # Internal-only: Kafka is consumed via the compose network as
+    # `redpanda:9092`. Binding to 127.0.0.1 keeps the external listener
+    # reachable for a local `rpk` on the host without exposing it to the
+    # host's network interfaces.
+    ports:
+      - "127.0.0.1:19092:19092"
+    restart: unless-stopped
+    command:
+      - redpanda
+      - start
+      - --overprovisioned
+      - --smp=1
+      - --memory=1G
+      - --reserve-memory=0M
+      - --node-id=0
+      - --check=false
+      - --kafka-addr=internal://0.0.0.0:9092,external://0.0.0.0:19092
+      - --advertise-kafka-addr=internal://redpanda:9092,external://127.0.0.1:19092
+    # Round-24 F3: pin the Kafka log dir onto a named volume so
+    # `docker compose down` / `docker rm` / image bumps do not destroy
+    # every signed receipt, ATIF trajectory, and lifecycle outbox the
+    # bridge has published. The compose file's whole reason to exist
+    # (over docker-compose.minimal.yml) is a durable audit trail;
+    # redis-data was already pinned, redpanda-data was missed.
+    volumes:
+      - redpanda-data:/var/lib/redpanda/data
+    healthcheck:
+      test: ["CMD-SHELL", "rpk cluster health | grep -Eq 'Healthy:[[:space:]]+true'"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+
+  redis:
+    image: redis:8.2.1-alpine
+    # Internal-only: state store is consumed via `redis://redis:6379` on the
+    # compose network. Localhost binding keeps `redis-cli` on the host
+    # working without publishing an unauthenticated Redis to the world.
+    ports:
+      - "127.0.0.1:6379:6379"
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes", "--appendfsync", "everysec"]
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+
+  qdrant:
+    image: qdrant/qdrant:v1.15.4
+    # Internal-only vector DB (see redpanda note above).
+    ports:
+      - "127.0.0.1:6333:6333"
+    restart: unless-stopped
+    volumes:
+      - qdrant-data:/qdrant/storage
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c ':> /dev/tcp/127.0.0.1/6333'"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+
+  minio:
+    image: minio/minio:RELEASE.2025-04-22T22-12-26Z
+    # Internal-only S3-compatible object store for the cold tier
+    # (`cold_uri = "s3://..."`). Used by CI's live cold-store contract
+    # test (`AV_COLD_S3_URL`); the entrypoint pre-creates the bucket so
+    # the conditional-put export path needs no client-side setup.
+    ports:
+      # Host 9100: port 9000 is commonly occupied on dev hosts.
+      - "127.0.0.1:9100:9000"
+    restart: unless-stopped
+    environment:
+      MINIO_ROOT_USER: agentvisor
+      MINIO_ROOT_PASSWORD: agentvisor-ci-secret
+    entrypoint: ["/bin/sh", "-c", "mkdir -p /data/agentvisor-cold && exec minio server /data"]
+    volumes:
+      - minio-data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://127.0.0.1:9000/minio/health/live"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+
+  nats:
+    image: nats:2.11-alpine
+    # Internal-only JetStream bus.
+    ports:
+      - "127.0.0.1:4222:4222"
+    restart: unless-stopped
+    # Round-24 F3: pin JetStream state to a named volume with `-sd`
+    # so the audit-trail bus (when bridge_backend = "nats") is not
+    # destroyed on container restart. `-js` alone stores JetStream in
+    # a randomly-named tmp dir under /tmp on some images and in
+    # /data on others; being explicit removes that ambiguity.
+    command: ["-js", "-sd", "/data", "-m", "8222"]
+    volumes:
+      - nats-data:/data
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8222/healthz"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+
+  vector:
+    image: timberio/vector:0.48.0-debian
+    # Internal-only OTLP receivers; agentvisor-ai sends via the compose network.
+    ports:
+      - "127.0.0.1:4317:4317"
+      - "127.0.0.1:4318:4318"
+    restart: unless-stopped
+    volumes:
+      - ./vector.toml:/etc/vector/vector.toml:ro
+      # Round-24 F1: the docker socket was previously mounted read-only
+      # for the docker_logs source. Read-only does NOT prevent Vector
+      # (or a malicious VRL transform) from calling `docker inspect` on
+      # every co-scheduled container, including agentvisor-ai, whose
+      # environment holds AV_UPSTREAM_API_KEY. The source has been
+      # switched to OTLP-only (agentvisor-ai already sends OTel logs via
+      # the compose network on 4318). If you need container-log
+      # discovery, put a docker-socket-proxy (e.g.
+      # tecnativa/docker-socket-proxy) in front and remount ONLY the
+      # proxy's socket into Vector — never the raw docker.sock.
+      # - /var/run/docker.sock:/var/run/docker.sock:ro
+
+volumes:
+  bridge-data:
+  atif-spool:
+  qdrant-data:
+  redis-data:
+  minio-data:
+  # Round-24 F3: persistent home for the audit-trail buses.
+  redpanda-data:
+  nats-data:
+
+secrets:
+  identity_hmac:
+    external: true
+  # Round-16 F3: the signing seed IS the receipt trust anchor.
+  # Populate as an external Docker secret before running compose:
+  #   `docker secret create signing_seed ./signing.seed`
+  # Or reference a compose-time file with `file: ./signing.seed`.
+  signing_seed:
+    external: true

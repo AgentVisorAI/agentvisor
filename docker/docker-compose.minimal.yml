@@ -1,0 +1,123 @@
+# AgentVisor AI minimal deployment: one container, zero external services.
+#
+#   docker compose -f docker/docker-compose.minimal.yml up
+#
+# Default upstream is Ollama on the Docker host. For a cloud provider:
+#
+#   AV_UPSTREAM_URL=https://api.openai.com \
+#   AV_UPSTREAM_API_KEY=sk-... \
+#   docker compose -f docker/docker-compose.minimal.yml up
+#
+# The full observability stack (Redpanda, Redis, Qdrant, Vector) lives in
+# docker-compose.yml next to this file.
+
+services:
+  agentvisor-ai:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    image: agentvisor-ai:local
+    container_name: agentvisor-ai
+    # Round-24 F6: parity with docker-compose.yml. The minimal
+    # template is advertised as the on-ramp for evaluators; without
+    # these knobs the same agentvisor-ai binary ships with a
+    # materially less-hardened surface than the full stack (default
+    # capabilities include NET_RAW / CHOWN / DAC_OVERRIDE, no
+    # process-cap, no grace budget for the four-phase shutdown).
+    # 180 s matches the docker-compose.yml sibling: this service
+    # mounts config/harness.container.toml which sets
+    # shutdown_drain_timeout_s = 110 (to fit the 300 s streaming
+    # window). Total worst case: 110 (drain) + 30 (worker) + 30
+    # (finalize) + 5 (OTel) = 175 s. Prior 120 s value dropped
+    # receipts on any docker stop that ran the drain to completion.
+    stop_grace_period: 180s
+    restart: unless-stopped
+    security_opt:
+      - "no-new-privileges:true"
+    cap_drop:
+      - ALL
+    pids_limit: 4096
+    ports:
+      # Round-16 F2: bind to 127.0.0.1 explicitly. Docker's default
+      # (`"8484:8484"`) means `0.0.0.0:8484` — reachable from any
+      # network interface. Combined with the shipped default
+      # `require_identity = false`, a LAN peer could otherwise
+      # exercise `/v1/chat/completions` against the operator's
+      # upstream credentials. Change this AND set
+      # `require_identity = true` if you actually want remote
+      # access.
+      - "127.0.0.1:8484:8484"
+    environment:
+      RUST_LOG: info
+      AV_CONFIG: /app/config/harness.container.toml
+      # ⚠️  ROUND-17 F2 WARNING — MINIMAL / DEMO TEMPLATE ⚠️
+      # This file uses a tmpfs /run mount for the signing seed. Every
+      # container restart REGENERATES the receipt trust anchor:
+      #   * receipts signed before a restart will not verify against
+      #     the new pubkey (key_id changes with the fresh seed);
+      #   * external auditors following your `pubkey` will silently
+      #     start failing every verify call after each redeploy.
+      # THIS TEMPLATE IS FOR LOCAL DEV / EVAL ONLY. For anything
+      # customer-facing, use `docker-compose.yml` (which mounts the
+      # seed from a docker secret with mode:0400), or wire your own
+      # persistent secret volume.
+      #
+      # Round-16 F3: keep the signing seed OFF the shared
+      # `bridge-data` volume so a co-scheduled container mounting
+      # `-v bridge-data:/x` cannot read the receipt trust anchor.
+      # The seed lives in the tmpfs /run path below; auto-generated
+      # by the harness on first boot via load_or_create_signer.
+      AV_SIGNING_SEED_FILE: /run/signing.seed
+      # Shell overrides for a cloud provider (see the header of this
+      # file). Compose does NOT forward host env vars unless they are
+      # declared here — without these mappings the documented
+      # `AV_UPSTREAM_URL=... AV_UPSTREAM_API_KEY=... docker compose up`
+      # on-ramp silently kept the Ollama default and ignored the key.
+      # Empty renders as unset: the daemon treats empty values as
+      # absent (`apply_env_overrides_from`), so leaving them undefined
+      # in the shell changes nothing.
+      AV_UPSTREAM_URL: ${AV_UPSTREAM_URL:-}
+      AV_UPSTREAM_API_KEY: ${AV_UPSTREAM_API_KEY:-}
+    volumes:
+      - bridge-data:/app/data
+      - atif-spool:/app/spool
+      # Round-16 F3: dedicated tmpfs for the signing seed so no
+      # named volume (which could be re-attached to any other
+      # container) ever carries the receipt trust anchor.
+      # Round-6: tmpfs mounts default to root:root, but the container
+      # runs as uid 65532 (Dockerfile USER) — without uid/gid options
+      # the harness cannot create /run/signing.seed and the first boot
+      # crash-loops on Permission denied.
+      # Round-33 F1: the `tmpfs.uid` / `tmpfs.gid` long-form fields are
+      # no longer in the compose spec (`docker compose config` refuses
+      # them). Use a named volume with the `local` driver + tmpfs opts
+      # instead — same tmpfs semantics, same uid ownership, but the
+      # schema validates cleanly. See volumes: block below.
+      - signing-seed:/run
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    healthcheck:
+      # Round-15 F8-mirror: hardcode the URL rather than relying on
+      # `avctl health`'s default matching whatever `listen` says.
+      # /readyz (not /health): a full disk keeps the constant green
+      # while every request 503s; readiness's writability probe flips.
+      test: ["CMD", "avctl", "health", "--url", "http://127.0.0.1:8484/readyz"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+volumes:
+  bridge-data:
+  atif-spool:
+  # Round-33 F1: replacement for the long-form `type: tmpfs` mount that
+  # used to live under the service's volumes:. The `local` driver with
+  # `type=tmpfs` gives us a tmpfs mount whose ownership is set via mount
+  # options — same runtime semantics as the old long-form (ephemeral,
+  # not shared with any other volume), but expressed in a way the
+  # current compose schema accepts.
+  signing-seed:
+    driver: local
+    driver_opts:
+      type: tmpfs
+      device: tmpfs
+      o: "uid=65532,gid=65532,mode=0700,size=16m"

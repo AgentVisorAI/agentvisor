@@ -1,0 +1,35 @@
+manifest_version: 1
+name: agentvisor-ai-local
+replication_factor: 1
+# NOTE on cold_uri: "data/cold" below is a RELATIVE path — it lands on
+# the same disk/PVC as the hot segments, so this "cold tier" only moves
+# bytes sideways. For a real off-box archive point it at an
+# S3-compatible object store (s3://bucket/prefix with AWS_* env
+# credentials; see AV_COLD_S3_URL contract in CONFORMANCE-STATUS.md) or a
+# separately-mounted volume. Topics with NO cold_uri delete records
+# past hot_hours outright — the daemon warns at boot.
+topics:
+  - name: agent.tool_call
+    partitions: 8
+    retention: { hot_hours: 720, cold_uri: "data/cold" }
+    schema_ref: schemas/ocsf-agent-event.schema.json
+  - name: agent.stop_reason
+    partitions: 8
+    retention: { hot_hours: 720, cold_uri: "data/cold" }
+    schema_ref: schemas/ocsf-agent-event.schema.json
+  - name: agent.receipt
+    partitions: 8
+    retention: { hot_hours: 720, cold_uri: "data/cold" }
+    schema_ref: schemas/ocsf-agent-event.schema.json
+  - name: agent.compression
+    partitions: 8
+    retention: { hot_hours: 720, cold_uri: "data/cold" }
+    schema_ref: schemas/ocsf-agent-event.schema.json
+  - name: agent.identity
+    partitions: 8
+    retention: { hot_hours: 720, cold_uri: "data/cold" }
+    schema_ref: schemas/ocsf-agent-event.schema.json
+  - name: agent.session
+    partitions: 8
+    retention: { hot_hours: 720, cold_uri: "data/cold" }
+    schema_ref: schemas/ocsf-agent-event.schema.json

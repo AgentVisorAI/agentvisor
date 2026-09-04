@@ -1,0 +1,1247 @@
+//! Provider adapter seam.
+//!
+//! The upstream was treated as OpenAI-shaped throughout the response
+//! path, which made "a second provider" the most painful change for
+//! this design to absorb. This module
+//! introduces the `ProviderAdapter` trait with the OpenAI
+//! adapter as its only implementation — a pure refactor. The SSE
+//! parser keeps its battle-tested implementation in `routes.rs`
+//! verbatim (BOM handling, `[DONE]`, `usage: null`, named-event
+//! refusal, metric-regression rejection); the adapter owns
+//! *selection*, so `AnthropicAdapter` / `GoogleGeminiAdapter`
+//! become additive.
+
+use std::sync::Arc;
+
+/// One upstream provider's wire dialect. Implementations must be
+/// total over arbitrary input (the fuzz target pins this for the
+/// OpenAI adapter) and must never panic on hostile frames.
+pub(crate) trait ProviderAdapter: Send + Sync {
+    /// Stable name, matching the `provider` config value.
+    fn name(&self) -> &'static str;
+    /// Parse one SSE frame (or one buffered non-streaming body) into
+    /// the provider-neutral chunk shape. `Ok(None)` means a
+    /// keepalive/`[DONE]`-style frame carrying nothing attributable.
+    fn parse_sse_chunk(&self, raw: &str) -> Result<Option<crate::routes::ParsedProviderChunk>, String>;
+}
+
+/// OpenAI wire dialect. Also fits vLLM, LiteLLM, Groq, Together,
+/// DeepSeek, OpenRouter, Ollama, LM Studio, llama.cpp, xAI, Mistral
+/// and Azure OpenAI, which emulate it.
+pub(crate) struct OpenAiAdapter;
+
+impl ProviderAdapter for OpenAiAdapter {
+    fn name(&self) -> &'static str {
+        "openai"
+    }
+
+    fn parse_sse_chunk(&self, raw: &str) -> Result<Option<crate::routes::ParsedProviderChunk>, String> {
+        crate::routes::parse_provider_chunk(raw)
+    }
+}
+
+/// Look up the adapter for a configured `provider` value. `None`
+/// means unsupported — config validation names the supported set so
+/// the daemon refuses at boot, not mid-stream.
+pub(crate) fn adapter_for(provider: &str) -> Option<Arc<dyn ProviderAdapter>> {
+    match provider {
+        "openai" => Some(Arc::new(OpenAiAdapter)),
+        "anthropic" => Some(Arc::new(AnthropicAdapter)),
+        "gemini" => Some(Arc::new(GoogleGeminiAdapter)),
+        _ => None,
+    }
+}
+
+/// The provider names `adapter_for` accepts, for config-validation
+/// error messages.
+pub(crate) const SUPPORTED_PROVIDERS: &[&str] = &["openai", "anthropic", "gemini"];
+
+/// Anthropic Messages API wire dialect (S3 step 2).
+///
+/// Streaming frames are named SSE events (`message_start`,
+/// `content_block_start/delta/stop`, `message_delta`, `message_stop`,
+/// `ping`, `error`); non-streaming bodies are a single
+/// `{"type":"message", "content":[...]}` document. Mapping into the
+/// provider-neutral chunk:
+///
+/// * `text_delta`/`text` blocks → `message`;
+///   `thinking_delta`/`thinking` blocks → `reasoning`.
+/// * `tool_use` blocks / `input_json_delta` → tool-call deltas keyed
+///   by the content-block `index` (Anthropic has no choices array;
+///   `choice_index` is always 0).
+/// * `usage.input_tokens` → prompt, `usage.output_tokens` →
+///   completion (Anthropic reports output cumulatively, matching the
+///   `completion_reported` cumulative contract),
+///   `usage.cache_read_input_tokens` → cached.
+/// * `stop_reason` passes through natively — `map_finish_reason`
+///   already folds `end_turn`/`max_tokens`/`tool_use`/
+///   `stop_sequence` into the audit-chain stop taxonomy.
+/// * `event: error` fails the frame (capture must not attribute an
+///   error payload as model output — same posture as the OpenAI
+///   adapter's named-event refusal); `ping`/`message_stop` are
+///   keepalives.
+pub(crate) struct AnthropicAdapter;
+
+/// Anthropic SSE event names whose payloads this adapter captures.
+const ANTHROPIC_CONTENT_EVENTS: &[&str] = &[
+    "message_start",
+    "content_block_start",
+    "content_block_delta",
+    "content_block_stop",
+    "message_delta",
+];
+
+impl ProviderAdapter for AnthropicAdapter {
+    fn name(&self) -> &'static str {
+        "anthropic"
+    }
+
+    fn parse_sse_chunk(&self, raw: &str) -> Result<Option<crate::routes::ParsedProviderChunk>, String> {
+        // Same SSE §9.2 discipline as the OpenAI parser: strip one
+        // leading BOM, collect `data:` lines (one optional leading
+        // space each), track the frame's `event:` name.
+        let raw = raw.strip_prefix('\u{feff}').unwrap_or(raw);
+        let mut is_sse = false;
+        let mut event_type = String::new();
+        let mut data = Vec::new();
+        for line in raw.split(['\r', '\n']) {
+            if let Some(value) = line.strip_prefix("data:") {
+                is_sse = true;
+                data.push(value.strip_prefix(' ').unwrap_or(value));
+            } else if let Some(value) = line.strip_prefix("event:") {
+                is_sse = true;
+                event_type = value.strip_prefix(' ').unwrap_or(value).to_owned();
+            } else if line == "data"
+                || line.starts_with("id:")
+                || line.starts_with("retry:")
+                || line.starts_with(':')
+            {
+                is_sse = true;
+            }
+        }
+        let candidate = if is_sse {
+            if data.iter().all(|entry| entry.trim().is_empty()) {
+                // Dataless frames — named keepalives included — carry
+                // nothing attributable.
+                return Ok(None);
+            }
+            data.join("\n")
+        } else {
+            raw.trim().to_owned()
+        };
+        if candidate.is_empty() {
+            return Ok(None);
+        }
+        // `[DONE]` is technically OpenAI's terminator, not Anthropic's,
+        // but OpenAI-compat gateways (LiteLLM in `--rewrite openai`
+        // mode, OpenRouter's Anthropic passthrough with
+        // `stream_options`) commonly append it. Treat it as a keepalive
+        // rather than trying to `serde_json::from_str("[DONE]")` and
+        // aborting the whole stream on its last frame. Same handling
+        // is applied by the OpenAI parser directly.
+        if candidate.trim() == "[DONE]" {
+            return Ok(None);
+        }
+        let value: serde_json::Value = serde_json::from_str(&candidate)
+            .map_err(|error| format!("invalid provider JSON frame: {error}"))?;
+        let frame_type = value
+            .get("type")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_owned();
+        // The SSE event name and the payload's `type` field are
+        // redundant in the Anthropic dialect; require agreement when
+        // both are present so a hostile frame cannot smuggle an error
+        // payload under a content event name (or vice versa).
+        //
+        // Exception: SSE §9.2.6 makes `message` the default event name
+        // — an empty `event:` field, or its absence, MUST behave as if
+        // `event: message` was set. Gateways (LiteLLM, OpenRouter,
+        // some enterprise OpenAI-compat proxies) commonly normalise
+        // Anthropic's named events under this default when relaying
+        // to a client that consumed the OpenAI shape. Treating
+        // `event: message` as SSE-default (equivalent to unset) here
+        // matches the OpenAI parser's ordering at routes.rs:3749, so
+        // an Anthropic wire that a gateway relabels under `message`
+        // does not fail-close where the same content on OpenAI passes.
+        if is_sse && !event_type.is_empty() && event_type != "message" && event_type != frame_type {
+            return Err(format!(
+                "provider SSE event name {event_type:?} does not match payload type {frame_type:?}"
+            ));
+        }
+        match frame_type.as_str() {
+            "ping" | "message_stop" => return Ok(None),
+            "error" => {
+                return Err(format!(
+                    "provider streamed an error event: {}",
+                    value
+                        .pointer("/error/message")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("(no message)")
+                ));
+            }
+            "message" => {} // non-streaming body
+            other if ANTHROPIC_CONTENT_EVENTS.contains(&other) => {}
+            other => {
+                return Err(format!(
+                    "provider frame carries unsupported Anthropic type {other:?}; refusing to \
+                     attribute it to the audit surface"
+                ));
+            }
+        }
+        parse_anthropic_payload(&frame_type, &value)
+    }
+}
+
+/// Shared payload → chunk mapping for streaming events and the
+/// non-streaming `message` document.
+#[allow(clippy::too_many_lines)]
+fn parse_anthropic_payload(
+    frame_type: &str,
+    value: &serde_json::Value,
+) -> Result<Option<crate::routes::ParsedProviderChunk>, String> {
+    use crate::routes::{provider_u64, ParsedProviderChunk, ProviderToolCallDelta};
+    use serde_json::Value;
+
+    fn input_is_empty_object(v: &Value) -> bool {
+        v.as_object().is_some_and(serde_json::Map::is_empty)
+    }
+
+    let mut message = String::new();
+    let mut reasoning = String::new();
+    let mut finish_reason = None;
+    let mut tool_call_deltas = Vec::new();
+
+    // Usage may sit at the top level (message_delta, non-streaming) or
+    // under `message` (message_start).
+    let usage = value
+        .get("usage")
+        .or_else(|| value.pointer("/message/usage"))
+        .filter(|usage| !usage.is_null());
+    let mut usage_reported = false;
+    let mut prompt_tokens = None;
+    let mut completion_tokens = None;
+    let mut cached_tokens = None;
+    if let Some(usage) = usage {
+        usage_reported = true;
+        prompt_tokens = provider_u64(usage.get("input_tokens"), "input_tokens")?;
+        completion_tokens = provider_u64(usage.get("output_tokens"), "output_tokens")?;
+        cached_tokens = provider_u64(usage.get("cache_read_input_tokens"), "cache_read_input_tokens")?;
+    }
+    let model_name = value
+        .get("model")
+        .or_else(|| value.pointer("/message/model"))
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    if let Some(reason) = value
+        .get("stop_reason")
+        .or_else(|| value.pointer("/delta/stop_reason"))
+        .or_else(|| value.pointer("/message/stop_reason"))
+        .and_then(Value::as_str)
+        .filter(|reason| !reason.is_empty())
+    {
+        finish_reason = Some(reason.to_owned());
+    }
+
+    let mut absorb_block = |index: u64, block: &Value, is_streaming_start: bool| -> Result<(), String> {
+        match block.get("type").and_then(Value::as_str).unwrap_or_default() {
+            "text" | "text_delta" => {
+                if let Some(text) = block.get("text").and_then(Value::as_str) {
+                    message.push_str(text);
+                }
+            }
+            "thinking" | "thinking_delta" => {
+                if let Some(text) = block
+                    .get("thinking")
+                    .or_else(|| block.get("text"))
+                    .and_then(Value::as_str)
+                {
+                    reasoning.push_str(text);
+                }
+            }
+            "tool_use" => {
+                // Two distinct scenarios share this arm:
+                //
+                //  1. NON-STREAMING (`message` / `message_start` with
+                //     the content array inline): `input` carries the
+                //     COMPLETE argument object. A zero-arg call arrives
+                //     as `"input":{}` and must attest as `"{}"` — the
+                //     same wire shape OpenAI produces (`"arguments":
+                //     "{}"`) — so the same logical call signs
+                //     identically regardless of provider. Pre-R14 this
+                //     branch fell through to `arguments = ""` and the
+                //     downstream fallback wrote `{"raw":""}` into the
+                //     signed ATIF step.
+                //
+                //  2. STREAMING (`content_block_start`): Anthropic's
+                //     protocol ALWAYS ships `"input":{}` here as a
+                //     PLACEHOLDER, then follows with
+                //     `input_json_delta.partial_json` chunks that
+                //     `absorb_frame` CONCATENATES into `arguments`.
+                //     Emitting `"{}"` here would corrupt every
+                //     non-empty streaming tool_use to
+                //     `{}{"city":"…"}` — invalid JSON, and the
+                //     `.unwrap_or_else(|_| json!({"raw": …}))`
+                //     fallback at routes.rs:4024 would attest the
+                //     mangled string. Emit `""` instead; the truly
+                //     zero-arg streaming case (no delta frames follow)
+                //     is normalised at that same finalize point,
+                //     where empty accumulated args become `"{}"`
+                //     before the parse attempt.
+                let arguments = match block.get("input") {
+                    Some(input)
+                        if !input.is_null() && !(is_streaming_start && input_is_empty_object(input)) =>
+                    {
+                        serde_json::to_string(input)
+                            .map_err(|error| format!("provider tool input is not serializable: {error}"))?
+                    }
+                    _ if is_streaming_start => String::new(),
+                    _ => "{}".to_owned(),
+                };
+                tool_call_deltas.push(ProviderToolCallDelta {
+                    choice_index: 0,
+                    index,
+                    complete: false,
+                    id: block.get("id").and_then(Value::as_str).map(str::to_owned),
+                    name: block.get("name").and_then(Value::as_str).map(str::to_owned),
+                    arguments,
+                });
+            }
+            "input_json_delta" => {
+                tool_call_deltas.push(ProviderToolCallDelta {
+                    choice_index: 0,
+                    index,
+                    complete: false,
+                    id: None,
+                    name: None,
+                    arguments: block
+                        .get("partial_json")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_owned(),
+                });
+            }
+            // signature_delta, redacted_thinking, server_tool_use
+            // results, citations: nothing attributable to capture.
+            _ => {}
+        }
+        Ok(())
+    };
+
+    match frame_type {
+        "content_block_start" | "content_block_delta" => {
+            let index = provider_u64(value.get("index"), "content block index")?
+                .ok_or_else(|| "provider content block has no index".to_owned())?;
+            let block = value
+                .get("content_block")
+                .or_else(|| value.get("delta"))
+                .ok_or_else(|| "provider content frame has no block payload".to_owned())?;
+            // Only the START frame carries the tool_use placeholder;
+            // `content_block_delta` frames of type `input_json_delta`
+            // are the concatenated chunks, never a placeholder.
+            let is_streaming_start = frame_type == "content_block_start";
+            absorb_block(index, block, is_streaming_start)?;
+        }
+        "message" | "message_start" => {
+            let content = value.get("content").or_else(|| value.pointer("/message/content"));
+            if let Some(Value::Array(blocks)) = content {
+                for (position, block) in blocks.iter().enumerate() {
+                    let index =
+                        u64::try_from(position).map_err(|_| "provider content index overflow".to_owned())?;
+                    absorb_block(index, block, false)?;
+                }
+            }
+        }
+        // message_delta / content_block_stop carry no content blocks.
+        _ => {}
+    }
+
+    let completion_reported = completion_tokens.is_some();
+    let completion_tokens = completion_tokens.unwrap_or_else(|| {
+        let mut estimated = av_core::tokens::approx_tokens(&message)
+            .saturating_add(av_core::tokens::approx_tokens(&reasoning));
+        for call in &tool_call_deltas {
+            estimated = estimated
+                .saturating_add(call.name.as_deref().map_or(0, av_core::tokens::approx_tokens))
+                .saturating_add(av_core::tokens::approx_tokens(&call.arguments));
+        }
+        estimated
+    });
+    Ok(Some(ParsedProviderChunk {
+        message,
+        reasoning: (!reasoning.is_empty()).then_some(reasoning),
+        model_name,
+        metrics: av_events::EventMetrics {
+            prompt_tokens,
+            completion_tokens: Some(completion_tokens),
+            cached_tokens,
+            pruned_tokens: None,
+            pruning_ratio_millis: None,
+        },
+        usage_reported,
+        completion_reported,
+        finish_reason,
+        // Anthropic does not report request cost on the wire.
+        cost_usd_micros: 0,
+        cost_reported: false,
+        // A recognized Anthropic frame is the dialect's equivalent of
+        // "has a choices array": absorb_frame's empty-200 guard keys
+        // on this.
+        has_choices: true,
+        tool_call_deltas,
+    }))
+}
+
+/// Google Gemini `generateContent`/`streamGenerateContent` wire
+/// dialect (S3 step 3).
+///
+/// Streaming uses UNNAMED `data:` frames (`?alt=sse`); each frame and
+/// the non-streaming body share one shape:
+/// `candidates[].content.parts[]` for text/`thought`/`functionCall`
+/// parts, `usageMetadata` for accounting, `finishReason` (SCREAMING
+/// case) on the final candidate frame. Mapping into the
+/// provider-neutral chunk:
+///
+/// * text parts → `message`; parts flagged `"thought": true` →
+///   `reasoning`.
+/// * `functionCall` parts → tool-call deltas keyed by
+///   (candidate index, part position); Gemini function calls arrive
+///   complete, with `args` as a JSON object serialized verbatim.
+/// * `promptTokenCount` → prompt, `candidatesTokenCount` →
+///   completion (cumulative across frames), `cachedContentTokenCount`
+///   → cached.
+/// * `finishReason` folds into the OpenAI-lowercase taxonomy the
+///   audit chain understands: `STOP`→`stop`, `MAX_TOKENS`→
+///   `max_tokens`, safety-class refusals → `content_filter`; other
+///   values pass through lowercased (→ `StopReason::Other`).
+/// * `promptFeedback.blockReason` (request refused before any
+///   candidate) → `content_filter`.
+/// * Named SSE events are refused when they carry data (Gemini never
+///   names its frames; a named frame is not attributable), mirroring
+///   the OpenAI adapter's posture.
+pub(crate) struct GoogleGeminiAdapter;
+
+impl ProviderAdapter for GoogleGeminiAdapter {
+    fn name(&self) -> &'static str {
+        "gemini"
+    }
+
+    fn parse_sse_chunk(&self, raw: &str) -> Result<Option<crate::routes::ParsedProviderChunk>, String> {
+        use crate::routes::{provider_u64, ParsedProviderChunk, ProviderToolCallDelta};
+        use serde_json::Value;
+
+        let raw = raw.strip_prefix('\u{feff}').unwrap_or(raw);
+        let mut is_sse = false;
+        let mut event_type = String::new();
+        let mut data = Vec::new();
+        for line in raw.split(['\r', '\n']) {
+            if let Some(value) = line.strip_prefix("data:") {
+                is_sse = true;
+                data.push(value.strip_prefix(' ').unwrap_or(value));
+            } else if let Some(value) = line.strip_prefix("event:") {
+                is_sse = true;
+                event_type = value.strip_prefix(' ').unwrap_or(value).to_owned();
+            } else if line == "data"
+                || line.starts_with("id:")
+                || line.starts_with("retry:")
+                || line.starts_with(':')
+            {
+                is_sse = true;
+            }
+        }
+        if is_sse && !event_type.is_empty() && event_type != "message" {
+            // Same [DONE]-under-named-event carve-out as the OpenAI
+            // parser (routes.rs:3765) and the Anthropic parser's
+            // ordering (`[DONE]` short-circuits before the event-
+            // type check). `[DONE]` is a sentinel; a named event
+            // carrying only [DONE] lines has no attributable content
+            // and must not fail-close the whole stream. OpenAI-compat
+            // gateways fronting Gemini (per the comment below at
+            // line 472) commonly batch a final `[DONE]` under a
+            // summary event as they finalise their own event stream.
+            if data.iter().all(|entry| {
+                let trimmed = entry.trim();
+                trimmed.is_empty() || trimmed == "[DONE]"
+            }) {
+                return Ok(None);
+            }
+            return Err(format!(
+                "provider SSE frame carries unsupported event type {event_type:?}; the Gemini \
+                 dialect uses unnamed data frames, so a named frame is not attributable"
+            ));
+        }
+        let candidate = if is_sse {
+            if data.iter().all(|entry| entry.trim().is_empty()) {
+                return Ok(None);
+            }
+            data.join("\n")
+        } else {
+            raw.trim().to_owned()
+        };
+        if candidate.is_empty() {
+            return Ok(None);
+        }
+        // `[DONE]` is OpenAI-shaped, not Gemini's native terminator,
+        // but OpenAI-compat gateways in front of Gemini commonly
+        // append it. Treat as keepalive instead of aborting the
+        // stream on its last frame. Same handling as OpenAI and
+        // Anthropic parsers.
+        if candidate.trim() == "[DONE]" {
+            return Ok(None);
+        }
+        let value: Value = serde_json::from_str(&candidate)
+            .map_err(|error| format!("invalid provider JSON frame: {error}"))?;
+
+        // Same top-level error handling as the OpenAI parser: a
+        // Gemini-shaped stream can carry `{"error":{"code":...,
+        // "message":"...","status":"..."}}` mid-stream. Pre-fix this
+        // fell through to `has_choices = false` (no candidates, no
+        // usage, no finishReason) and aborted with the generic "no
+        // choices array" — the provider's real reason (INVALID_ARGUMENT,
+        // RESOURCE_EXHAUSTED, PERMISSION_DENIED) never reached the
+        // receipt.
+        if let Some(err_obj) = value.get("error").filter(|v| !v.is_null()) {
+            let message = err_obj
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or("provider ended stream with an unspecified error");
+            let status = err_obj.get("status").and_then(Value::as_str).unwrap_or("");
+            return Err(if status.is_empty() {
+                format!("provider stream error: {message}")
+            } else {
+                format!("provider stream error [{status}]: {message}")
+            });
+        }
+
+        let mut message = String::new();
+        let mut reasoning = String::new();
+        let mut finish_reason = None;
+        let mut tool_call_deltas = Vec::new();
+
+        let mut usage_reported = false;
+        let mut prompt_tokens = None;
+        let mut completion_tokens = None;
+        let mut cached_tokens = None;
+        if let Some(usage) = value.get("usageMetadata").filter(|usage| !usage.is_null()) {
+            usage_reported = true;
+            prompt_tokens = provider_u64(usage.get("promptTokenCount"), "promptTokenCount")?;
+            completion_tokens = provider_u64(usage.get("candidatesTokenCount"), "candidatesTokenCount")?;
+            cached_tokens = provider_u64(usage.get("cachedContentTokenCount"), "cachedContentTokenCount")?;
+        }
+        let model_name = value
+            .get("modelVersion")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        // A safety block before any candidate is a terminal refusal.
+        if value
+            .pointer("/promptFeedback/blockReason")
+            .and_then(Value::as_str)
+            .is_some_and(|reason| !reason.is_empty())
+        {
+            finish_reason = Some("content_filter".to_owned());
+        }
+
+        let has_candidates = value.get("candidates").is_some();
+        let candidates = match value.get("candidates") {
+            Some(Value::Array(candidates)) => Some(candidates),
+            Some(_) => return Err("provider candidates is not an array".to_owned()),
+            None => None,
+        };
+        if let Some(candidates) = candidates {
+            for (candidate_position, entry) in candidates.iter().enumerate() {
+                let choice_index = entry
+                    .get("index")
+                    .and_then(Value::as_u64)
+                    .or_else(|| u64::try_from(candidate_position).ok())
+                    .unwrap_or(u64::MAX);
+                if let Some(reason) = entry
+                    .get("finishReason")
+                    .and_then(Value::as_str)
+                    .filter(|reason| !reason.is_empty())
+                {
+                    finish_reason = Some(map_gemini_finish_reason(reason));
+                }
+                let parts = match entry.pointer("/content/parts") {
+                    Some(Value::Array(parts)) => parts.as_slice(),
+                    Some(Value::Null) | None => &[],
+                    Some(_) => return Err("provider content parts is not an array".to_owned()),
+                };
+                for (position, part) in parts.iter().enumerate() {
+                    if let Some(text) = part.get("text").and_then(Value::as_str) {
+                        if part.get("thought").and_then(Value::as_bool).unwrap_or(false) {
+                            reasoning.push_str(text);
+                        } else {
+                            message.push_str(text);
+                        }
+                    }
+                    if let Some(call) = part.get("functionCall").filter(|call| !call.is_null()) {
+                        // Emit `"{}"` when args are absent/null, mirroring the
+                        // Anthropic tool_use fix above and OpenAI's
+                        // `"arguments":"{}"` for a zero-arg tool call.
+                        // Falling through to `String::new()` here made the
+                        // ATIF step attest `{"raw":""}` on Gemini while the
+                        // OpenAI equivalent for the same logical call
+                        // attested `{}`, breaking the "same signature ⇔
+                        // same bytes" auditor invariant across providers.
+                        let arguments = match call.get("args") {
+                            Some(args) if !args.is_null() => {
+                                serde_json::to_string(args).map_err(|error| {
+                                    format!("provider function args are not serializable: {error}")
+                                })?
+                            }
+                            _ => "{}".to_owned(),
+                        };
+                        tool_call_deltas.push(ProviderToolCallDelta {
+                            choice_index,
+                            // Frame-local part position, NOT stable
+                            // across streamed chunks (Gemini restarts
+                            // `parts` at 0 every frame). `complete`
+                            // tells `absorb_frame` to allocate a fresh
+                            // per-choice slot instead of merging on it.
+                            index: u64::try_from(position)
+                                .map_err(|_| "provider part index overflow".to_owned())?,
+                            complete: true,
+                            id: call.get("id").and_then(Value::as_str).map(str::to_owned),
+                            name: call.get("name").and_then(Value::as_str).map(str::to_owned),
+                            arguments,
+                        });
+                    }
+                }
+            }
+        }
+        let completion_reported = completion_tokens.is_some();
+        let completion_tokens = completion_tokens.unwrap_or_else(|| {
+            let mut estimated = av_core::tokens::approx_tokens(&message)
+                .saturating_add(av_core::tokens::approx_tokens(&reasoning));
+            for call in &tool_call_deltas {
+                estimated = estimated
+                    .saturating_add(call.name.as_deref().map_or(0, av_core::tokens::approx_tokens))
+                    .saturating_add(av_core::tokens::approx_tokens(&call.arguments));
+            }
+            estimated
+        });
+        // Candidates or usage-only frames are the dialect's
+        // equivalent of a choices array for the empty-200 guard. A
+        // prompt-safety block (`promptFeedback.blockReason`) is a
+        // terminal refusal that Gemini may emit with NEITHER
+        // candidates nor usageMetadata — the parser maps it to
+        // `content_filter` above, so it must count as a valid frame
+        // or the guard misclassifies a clean refusal as a capture
+        // failure (502 instead of a content-filter stop).
+        let has_choices = has_candidates || usage_reported || finish_reason.is_some();
+        Ok(Some(ParsedProviderChunk {
+            message,
+            reasoning: (!reasoning.is_empty()).then_some(reasoning),
+            model_name,
+            metrics: av_events::EventMetrics {
+                prompt_tokens,
+                completion_tokens: Some(completion_tokens),
+                cached_tokens,
+                pruned_tokens: None,
+                pruning_ratio_millis: None,
+            },
+            usage_reported,
+            completion_reported,
+            finish_reason,
+            // Gemini does not report request cost on the wire.
+            cost_usd_micros: 0,
+            cost_reported: false,
+            has_choices,
+            tool_call_deltas,
+        }))
+    }
+}
+
+/// Fold Gemini's SCREAMING_CASE `finishReason` into the lowercase
+/// taxonomy `map_finish_reason` understands. Safety-class refusals
+/// all map to `content_filter`; unknown values pass through
+/// lowercased and land on `StopReason::Other`.
+fn map_gemini_finish_reason(reason: &str) -> String {
+    match reason {
+        "STOP" => "stop".to_owned(),
+        "MAX_TOKENS" => "max_tokens".to_owned(),
+        "SAFETY" | "RECITATION" | "BLOCKLIST" | "PROHIBITED_CONTENT" | "SPII" => "content_filter".to_owned(),
+        // Gemini emits these when the model tried to invoke a tool
+        // but produced invalid JSON args, or invoked a tool that
+        // wasn't declared. Both are semantically tool-shaped stops
+        // (a signal to the auditor: "the model tried to use a
+        // tool"), not generic "Other" — dashboards grouping
+        // tool-call correctness failures need them in the ToolUse
+        // bucket rather than in Other's grab-bag.
+        "MALFORMED_FUNCTION_CALL" | "UNEXPECTED_TOOL_CALL" => "tool_calls".to_owned(),
+        other => other.to_ascii_lowercase(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(
+        clippy::unwrap_used,
+        clippy::indexing_slicing,
+        clippy::expect_used,
+        clippy::panic
+    )]
+
+    use super::*;
+
+    /// The adapter must be a transparent shim over the routes parser
+    /// (S3 step 1 is a pure refactor): same chunk for a normal
+    /// frame, same keepalive `None`, same totality on garbage.
+    #[test]
+    fn openai_adapter_is_a_transparent_shim() {
+        let adapter = adapter_for("openai").unwrap();
+        assert_eq!(adapter.name(), "openai");
+        let parsed = adapter
+            .parse_sse_chunk(r#"data: {"choices":[{"delta":{"content":"hi"}}]}"#)
+            .unwrap()
+            .unwrap();
+        assert_eq!(parsed.message, "hi");
+        assert!(adapter.parse_sse_chunk("data: [DONE]").unwrap().is_none());
+        assert!(adapter.parse_sse_chunk(": keepalive").unwrap().is_none());
+        // Total over hostile input: an error, never a panic.
+        let _ = adapter.parse_sse_chunk("data: {\"usage\":{\"prompt_tokens\":-1}}");
+    }
+
+    #[test]
+    fn unknown_providers_are_refused() {
+        assert!(
+            adapter_for("google").is_none(),
+            "the Gemini dialect registers as \"gemini\", not \"google\""
+        );
+        assert!(adapter_for("").is_none());
+        for name in SUPPORTED_PROVIDERS {
+            assert!(adapter_for(name).is_some(), "{name} must be constructible");
+        }
+    }
+
+    /// The Gemini streaming dialect maps into the provider-neutral
+    /// chunk: text and thought parts, complete functionCall parts,
+    /// cumulative usageMetadata, SCREAMING_CASE finish reasons folded
+    /// into the audit taxonomy, and safety blocks.
+    #[test]
+    fn gemini_streaming_dialect_maps_to_neutral_chunks() {
+        let adapter = adapter_for("gemini").unwrap();
+        assert_eq!(adapter.name(), "gemini");
+
+        let first = adapter
+            .parse_sse_chunk(
+                "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"Hello\"},{\"text\":\"plan...\",\"thought\":true}],\"role\":\"model\"},\"index\":0}],\"usageMetadata\":{\"promptTokenCount\":25,\"candidatesTokenCount\":1,\"cachedContentTokenCount\":7},\"modelVersion\":\"gemini-2.0-flash\"}",
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.message, "Hello");
+        assert_eq!(first.reasoning.as_deref(), Some("plan..."));
+        assert_eq!(first.model_name.as_deref(), Some("gemini-2.0-flash"));
+        assert!(first.usage_reported && first.completion_reported);
+        assert_eq!(first.metrics.prompt_tokens, Some(25));
+        assert_eq!(first.metrics.completion_tokens, Some(1));
+        assert_eq!(first.metrics.cached_tokens, Some(7));
+        assert!(first.has_choices);
+
+        let tool = adapter
+            .parse_sse_chunk(
+                "data: {\"candidates\":[{\"content\":{\"parts\":[{\"functionCall\":{\"name\":\"get_weather\",\"args\":{\"city\":\"Paris\"}}}]},\"index\":0}]}",
+            )
+            .unwrap()
+            .unwrap();
+        let delta = &tool.tool_call_deltas[0];
+        assert_eq!(delta.name.as_deref(), Some("get_weather"));
+        assert_eq!(delta.arguments, r#"{"city":"Paris"}"#);
+        assert_eq!((delta.choice_index, delta.index), (0, 0));
+        // Explicit `args: null` maps to EMPTY arguments, not the string
+        // "null" (mutation-run hardening, round 10 — the null guard was
+        // unpinned and a literal "null" would corrupt the accumulated
+        // tool-call arguments downstream).
+        let null_args = adapter
+            .parse_sse_chunk(
+                "data: {\"candidates\":[{\"content\":{\"parts\":[{\"functionCall\":{\"name\":\"noop\",\"args\":null}}]},\"index\":0}]}",
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            null_args.tool_call_deltas[0].arguments, "{}",
+            "R14: args=null zero-arg call attests \"{{}}\" to match OpenAI's semantic-equivalent \
+             wire encoding — the pre-R14 empty-string leaked into the signed step as {{\"raw\":\"\"}}"
+        );
+        // A candidates-only frame (no usage, no finish reason) must pass
+        // the empty-200 guard on candidates alone — pins the first arm
+        // of the has_choices disjunction independently of the other two.
+        assert!(tool.has_choices, "a candidates-only frame is a valid frame");
+
+        let last = adapter
+            .parse_sse_chunk(
+                "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"!\"}]},\"finishReason\":\"STOP\",\"index\":0}],\"usageMetadata\":{\"promptTokenCount\":25,\"candidatesTokenCount\":15}}",
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(last.finish_reason.as_deref(), Some("stop"));
+        assert_eq!(last.metrics.completion_tokens, Some(15));
+
+        let blocked = adapter
+            .parse_sse_chunk(
+                "data: {\"promptFeedback\":{\"blockReason\":\"SAFETY\"},\"usageMetadata\":{\"promptTokenCount\":9}}",
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(blocked.finish_reason.as_deref(), Some("content_filter"));
+        assert!(blocked.has_choices, "usage-only frames pass the empty-200 guard");
+
+        // A safety block may arrive with NEITHER candidates nor
+        // usageMetadata. It is still a terminal refusal, not an
+        // empty-200 — pre-fix `has_choices` keyed only on
+        // candidates/usage, so this clean content-filter stop was
+        // misclassified as a capture failure (502 to the client).
+        let bare_block = adapter
+            .parse_sse_chunk("data: {\"promptFeedback\":{\"blockReason\":\"SAFETY\"}}")
+            .unwrap()
+            .unwrap();
+        assert_eq!(bare_block.finish_reason.as_deref(), Some("content_filter"));
+        assert!(
+            bare_block.has_choices,
+            "a usage-less safety block must pass the empty-200 guard"
+        );
+
+        let max = adapter
+            .parse_sse_chunk("data: {\"candidates\":[{\"finishReason\":\"MAX_TOKENS\",\"index\":0}]}")
+            .unwrap()
+            .unwrap();
+        assert_eq!(max.finish_reason.as_deref(), Some("max_tokens"));
+
+        assert!(adapter.parse_sse_chunk(": keepalive").unwrap().is_none());
+        assert!(adapter.parse_sse_chunk("event: ping\ndata:").unwrap().is_none());
+        assert!(
+            adapter
+                .parse_sse_chunk("event: custom\ndata: {\"candidates\":[]}")
+                .is_err(),
+            "named frames with data are not attributable in the Gemini dialect"
+        );
+        let _ = adapter.parse_sse_chunk("data: {not json");
+    }
+
+    /// Mutation-run hardening (round 10): the Anthropic SSE edge
+    /// frames were unpinned — bare `data` lines and id:/retry:-only
+    /// frames (all valid SSE) must classify as SSE keepalives, a
+    /// data-only frame (no `event:` line) must parse without the
+    /// name/type agreement check misfiring on the EMPTY event name,
+    /// and an unknown frame type must be refused fail-closed rather
+    /// than silently attributed.
+    #[test]
+    fn anthropic_sse_edge_frames_and_unknown_types() {
+        let adapter = adapter_for("anthropic").unwrap();
+        // Bare dataless `data` line: SSE keepalive, not raw JSON.
+        assert!(adapter.parse_sse_chunk("data").unwrap().is_none());
+        // id:/retry:-only frames: same.
+        assert!(adapter.parse_sse_chunk("id: 7\nretry: 250").unwrap().is_none());
+        // Data-only frame without an `event:` name: the name/type
+        // agreement guard must not fire on the empty name.
+        let parsed = adapter
+            .parse_sse_chunk(
+                "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}",
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(parsed.message, "hi");
+        // Unknown frame types are refused, never silently attributed.
+        let error = adapter
+            .parse_sse_chunk("event: hax\ndata: {\"type\":\"hax\"}")
+            .unwrap_err();
+        assert!(error.contains("unsupported Anthropic type"), "{error}");
+    }
+
+    /// The full Anthropic streaming dialect maps into the
+    /// provider-neutral chunk: text/thinking deltas, tool_use blocks
+    /// with input_json_delta argument fragments, cumulative usage,
+    /// native stop reasons, and keepalives.
+    #[test]
+    fn anthropic_streaming_dialect_maps_to_neutral_chunks() {
+        let adapter = adapter_for("anthropic").unwrap();
+        assert_eq!(adapter.name(), "anthropic");
+
+        let start = adapter
+            .parse_sse_chunk(
+                "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"model\":\"claude-sonnet-4-5\",\"usage\":{\"input_tokens\":25,\"output_tokens\":1,\"cache_read_input_tokens\":7}}}",
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(start.model_name.as_deref(), Some("claude-sonnet-4-5"));
+        assert!(start.usage_reported && start.completion_reported);
+        assert_eq!(start.metrics.prompt_tokens, Some(25));
+        assert_eq!(start.metrics.completion_tokens, Some(1));
+        assert_eq!(start.metrics.cached_tokens, Some(7));
+        assert!(start.has_choices);
+
+        let text = adapter
+            .parse_sse_chunk(
+                "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Hello\"}}",
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(text.message, "Hello");
+        assert!(!text.completion_reported, "no usage on content deltas");
+
+        let thinking = adapter
+            .parse_sse_chunk(
+                "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"hmm\"}}",
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(thinking.reasoning.as_deref(), Some("hmm"));
+
+        let tool_start = adapter
+            .parse_sse_chunk(
+                "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_1\",\"name\":\"get_weather\",\"input\":{}}}",
+            )
+            .unwrap()
+            .unwrap();
+        let delta = &tool_start.tool_call_deltas[0];
+        assert_eq!((delta.choice_index, delta.index), (0, 1));
+        assert_eq!(delta.id.as_deref(), Some("toolu_1"));
+        assert_eq!(delta.name.as_deref(), Some("get_weather"));
+        assert_eq!(
+            delta.arguments, "",
+            "R14 corrected: `content_block_start` with `input:{{}}` is a STREAMING placeholder \
+             that gets concatenated with subsequent `input_json_delta` chunks — emitting \"{{}}\" \
+             here would corrupt any non-empty streaming tool_use to `{{}}{{\"city\":…}}` at \
+             `absorb_frame`. The genuinely-zero-arg streaming case is normalised at finalize \
+             (empty accumulator → `\"{{}}\"` before parse), so audit parity holds without \
+             breaking the concatenation path."
+        );
+
+        let args = adapter
+            .parse_sse_chunk(
+                "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"city\\\":\"}}",
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(args.tool_call_deltas[0].arguments, "{\"city\":");
+
+        let finish = adapter
+            .parse_sse_chunk(
+                "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":15}}",
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(finish.finish_reason.as_deref(), Some("end_turn"));
+        assert!(finish.completion_reported);
+        assert_eq!(finish.metrics.completion_tokens, Some(15));
+
+        // Keepalives and stream end: nothing attributable.
+        assert!(adapter
+            .parse_sse_chunk("event: ping\ndata: {\"type\": \"ping\"}")
+            .unwrap()
+            .is_none());
+        assert!(adapter
+            .parse_sse_chunk("event: message_stop\ndata: {\"type\":\"message_stop\"}")
+            .unwrap()
+            .is_none());
+        assert!(adapter.parse_sse_chunk(": keepalive").unwrap().is_none());
+    }
+
+    /// Non-streaming Anthropic bodies (one `message` document) carry
+    /// content blocks, usage and stop_reason in one frame.
+    #[test]
+    fn anthropic_non_streaming_body_parses_whole_message() {
+        let adapter = adapter_for("anthropic").unwrap();
+        let parsed = adapter
+            .parse_sse_chunk(
+                r#"{"type":"message","model":"claude-sonnet-4-5","content":[{"type":"text","text":"Hi there"},{"type":"tool_use","id":"toolu_2","name":"read","input":{"path":"x"}}],"stop_reason":"tool_use","usage":{"input_tokens":9,"output_tokens":12}}"#,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(parsed.message, "Hi there");
+        assert_eq!(parsed.finish_reason.as_deref(), Some("tool_use"));
+        assert_eq!(parsed.metrics.prompt_tokens, Some(9));
+        assert_eq!(parsed.metrics.completion_tokens, Some(12));
+        assert_eq!(parsed.tool_call_deltas[0].arguments, r#"{"path":"x"}"#);
+    }
+
+    /// Hostile frames: error events must fail capture (never be
+    /// attributed as model output), event-name/payload-type mismatch
+    /// is refused, negative usage is refused, and the parser is total
+    /// over garbage.
+    #[test]
+    fn anthropic_hostile_frames_fail_closed() {
+        let adapter = adapter_for("anthropic").unwrap();
+        let error = adapter
+            .parse_sse_chunk(
+                "event: error\ndata: {\"type\":\"error\",\"error\":{\"message\":\"overloaded\"}}",
+            )
+            .unwrap_err();
+        assert!(
+            error.contains("overloaded"),
+            "error payload must fail capture: {error}"
+        );
+        assert!(adapter
+            .parse_sse_chunk(
+                "event: message_delta\ndata: {\"type\":\"error\",\"error\":{\"message\":\"smuggled\"}}"
+            )
+            .is_err());
+        assert!(adapter
+            .parse_sse_chunk(
+                "event: message_delta\ndata: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":-1}}"
+            )
+            .is_err());
+        let _ = adapter.parse_sse_chunk("data: {not json");
+        let _ = adapter.parse_sse_chunk("\u{feff}data: {\"type\":\"unknown_event\",\"x\":1}");
+    }
+
+    /// R14 (as corrected by R15 review-of-R14): adapter parity for
+    /// cross-provider audit invariants.
+    ///
+    /// (1) Zero-arg tool_use attests `arguments = "{}"` in the FINAL
+    ///     signed step regardless of provider. Anthropic's streaming
+    ///     `content_block_start` still emits `""` as the placeholder
+    ///     wire chunk (see the concatenation regression test below
+    ///     for why); the empty-accumulator → `"{}"` normalisation
+    ///     happens at finalize (`routes.rs::finalize_response`, where
+    ///     the tool_call becomes an `av_atif::ToolCall`).
+    /// (2) `[DONE]` terminator swallowed as keepalive so OpenAI-compat
+    ///     gateways (LiteLLM, OpenRouter passthroughs) don't fail-close
+    ///     the last frame of an Anthropic stream.
+    #[test]
+    fn anthropic_zero_arg_tool_use_and_done_terminator_parity() {
+        let adapter = adapter_for("anthropic").unwrap();
+        // A NON-streaming `message` frame (whole-body inline) with
+        // `input: {}` attests "{}" at the wire level — this path has
+        // no concatenation risk because the whole content array is
+        // present in one frame.
+        let frame = concat!(
+            r#"data: {"type":"message","content":[{"type":"tool_use","id":"toolu_1","name":"get_time","input":{}}],"#,
+            r#""stop_reason":"tool_use","usage":{"input_tokens":10,"output_tokens":3}}"#,
+        );
+        let parsed = adapter.parse_sse_chunk(frame).unwrap().unwrap();
+        assert_eq!(parsed.tool_call_deltas.len(), 1);
+        assert_eq!(
+            parsed.tool_call_deltas[0].arguments, "{}",
+            "non-streaming zero-arg tool_use attests \"{{}}\" — no concatenation risk here"
+        );
+        // `[DONE]` treated as keepalive, not a parse failure.
+        assert!(
+            adapter.parse_sse_chunk("data: [DONE]").unwrap().is_none(),
+            "OpenAI-compat gateways append [DONE]; must not fail-close the stream tail"
+        );
+        assert!(adapter.parse_sse_chunk("data: [DONE]  ").unwrap().is_none());
+    }
+
+    /// R44 Finding 1: SSE §9.2.6 makes `message` the default event
+    /// name, so a gateway that relabels Anthropic's named events
+    /// under `event: message` (as LiteLLM's `--rewrite openai` mode
+    /// does when relaying to a client that consumed the OpenAI shape)
+    /// must NOT fail-close a well-formed Anthropic payload just
+    /// because the outer `event:` name is the SSE default. Matches
+    /// the OpenAI parser's ordering at routes.rs:3749 which already
+    /// treats `event: message` as unset.
+    #[test]
+    fn anthropic_event_default_message_accepts_any_payload_type() {
+        let adapter = adapter_for("anthropic").unwrap();
+        let frame = concat!(
+            "event: message\n",
+            r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hi"}}"#,
+        );
+        let parsed = adapter
+            .parse_sse_chunk(frame)
+            .expect("SSE-default event: message must be accepted regardless of payload type");
+        assert!(
+            parsed.is_some(),
+            "content_block_delta under SSE-default event must produce a captured chunk"
+        );
+        // Non-default named events with mismatched payload type are STILL refused —
+        // the SSE-default carve-out doesn't relax the smuggle guard.
+        let hostile = concat!(
+            "event: content_block_delta\n",
+            r#"data: {"type":"error","error":{"message":"smuggled"}}"#,
+        );
+        assert!(
+            adapter.parse_sse_chunk(hostile).is_err(),
+            "non-default event with mismatched payload type must still fail-close"
+        );
+    }
+
+    /// R14: same adapter-parity properties for Gemini.
+    #[test]
+    fn gemini_zero_arg_function_call_and_done_terminator_parity() {
+        let adapter = adapter_for("gemini").unwrap();
+        // functionCall without `args` field (Gemini's zero-arg shape).
+        let frame = concat!(
+            r#"data: {"candidates":[{"index":0,"content":{"parts":[{"functionCall":{"name":"get_time"}}]}}],"#,
+            r#""modelVersion":"gemini-2.0-flash"}"#,
+        );
+        let parsed = adapter.parse_sse_chunk(frame).unwrap().unwrap();
+        assert_eq!(parsed.tool_call_deltas.len(), 1);
+        assert_eq!(
+            parsed.tool_call_deltas[0].arguments, "{}",
+            "zero-arg functionCall must attest arguments=\"{{}}\", not \"\""
+        );
+        // `[DONE]` treated as keepalive.
+        assert!(adapter.parse_sse_chunk("data: [DONE]").unwrap().is_none());
+    }
+
+    /// R45 review-of-R44: OpenAI-compat gateways fronting Gemini
+    /// commonly batch a final `[DONE]` under a summary event as they
+    /// finalise their own event stream. `[DONE]` under a named event
+    /// carries no attributable content and must be treated as a
+    /// keepalive, matching the OpenAI and Anthropic parsers' ordering.
+    /// R44 fixed this on the OpenAI parser but missed the Gemini
+    /// adapter sibling — R45 review caught the miss.
+    #[test]
+    fn gemini_done_under_named_event_is_keepalive() {
+        let adapter = adapter_for("gemini").unwrap();
+        for raw in [
+            "event: summary\ndata: [DONE]\n\n",
+            "event: error\ndata: [DONE]\n\n",
+            "event: custom\ndata:\ndata: [DONE]\n\n",
+            "event: batched\ndata: [DONE]\ndata: [DONE]\n\n",
+        ] {
+            match adapter.parse_sse_chunk(raw) {
+                Ok(None) => {}
+                Ok(Some(_)) => panic!(
+                    "[DONE] under named event {raw:?} must not yield a chunk (no attributable content)"
+                ),
+                Err(error) => {
+                    panic!("[DONE] under named event {raw:?} must not fail-close the Gemini stream: {error}")
+                }
+            }
+        }
+        // A named event with a mix of [DONE] AND real content must
+        // still refuse — Gemini's "named frames not attributable"
+        // property is preserved for real content.
+        let mixed = "event: error\ndata: [DONE]\ndata: {\"candidates\":[{\"index\":0}]}\n\n";
+        assert!(
+            adapter.parse_sse_chunk(mixed).is_err(),
+            "named event with mixed [DONE] + real content must still refuse: {mixed:?}"
+        );
+    }
+
+    /// R14: inline `{"error":{...}}` on 200-OK streams must fail
+    /// capture with the provider's own message, not fall through to
+    /// the generic "no choices array" abort — the provider's
+    /// diagnostic (context_length_exceeded, INVALID_ARGUMENT, etc.)
+    /// belongs in the receipt, not a synthetic reason.
+    #[test]
+    fn openai_inline_error_frame_fails_with_provider_message() {
+        let adapter = adapter_for("openai").unwrap();
+        let frame = r#"data: {"error":{"message":"context length exceeded","type":"invalid_request_error","code":"context_length_exceeded"}}"#;
+        let err = adapter.parse_sse_chunk(frame).unwrap_err();
+        assert!(err.contains("context length exceeded"), "{err}");
+        assert!(
+            err.contains("context_length_exceeded") || err.contains("[context_length_exceeded]"),
+            "provider error code must reach the diagnostic: {err}"
+        );
+    }
+
+    #[test]
+    fn gemini_inline_error_frame_fails_with_provider_message() {
+        let adapter = adapter_for("gemini").unwrap();
+        let frame =
+            r#"data: {"error":{"code":429,"message":"resource exhausted","status":"RESOURCE_EXHAUSTED"}}"#;
+        let err = adapter.parse_sse_chunk(frame).unwrap_err();
+        assert!(err.contains("resource exhausted"), "{err}");
+        assert!(
+            err.contains("RESOURCE_EXHAUSTED"),
+            "status must reach the diagnostic: {err}"
+        );
+    }
+
+    /// R14: Anthropic `pause_turn` (Claude 3.7+ extended-thinking +
+    /// tool sessions) and Gemini's `MALFORMED_FUNCTION_CALL` /
+    /// `UNEXPECTED_TOOL_CALL` both indicate tool-shaped stops.
+    /// Grouping them with Other hid a class of tool-call correctness
+    /// analytics that provider-agnostic dashboards need to see.
+    #[test]
+    fn provider_native_tool_shaped_stops_all_map_to_tool_use() {
+        // Anthropic `pause_turn` → ToolUse via map_finish_reason.
+        assert_eq!(
+            crate::routes::map_finish_reason("pause_turn"),
+            av_events::StopReason::ToolUse
+        );
+        // Gemini's tool-error finish reasons fold to lowercase
+        // "tool_calls" then to ToolUse via map_finish_reason.
+        assert_eq!(map_gemini_finish_reason("MALFORMED_FUNCTION_CALL"), "tool_calls");
+        assert_eq!(map_gemini_finish_reason("UNEXPECTED_TOOL_CALL"), "tool_calls");
+        assert_eq!(
+            crate::routes::map_finish_reason("tool_calls"),
+            av_events::StopReason::ToolUse
+        );
+    }
+
+    /// R15 (review-of-R14): Anthropic streaming tool_use concatenation
+    /// regression. `content_block_start` ships `"input":{}` as a
+    /// placeholder — R14 initially emitted `"{}"` here, which
+    /// concatenated with subsequent `input_json_delta` chunks into
+    /// `{}{"city":…}` (invalid JSON). This test walks a real
+    /// three-frame streaming sequence, concatenates the deltas the
+    /// way `absorb_frame` does (`push_bounded`), and asserts:
+    ///   (a) the wire-level placeholder is empty
+    ///   (b) the accumulated arguments parse as valid JSON
+    ///   (c) `normalize_tool_call_arguments` renders the final
+    ///       attested `Value` — proving audit parity end-to-end.
+    #[test]
+    fn anthropic_streaming_tool_use_concatenates_to_valid_json_end_to_end() {
+        let adapter = adapter_for("anthropic").unwrap();
+        // Frame 1: content_block_start, placeholder input.
+        let start = adapter
+            .parse_sse_chunk(concat!(
+                r#"event: content_block_start"#,
+                "\n",
+                r#"data: {"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"toolu_1","name":"get_weather","input":{}}}"#,
+            ))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            start.tool_call_deltas[0].arguments, "",
+            "placeholder MUST be empty — otherwise concatenation with subsequent \
+             input_json_delta chunks corrupts to `{{}}{{...}}`"
+        );
+
+        // Frame 2 + 3: input_json_delta chunks that concatenate.
+        let d1 = adapter
+            .parse_sse_chunk(
+                r#"data: {"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\"city\":"}}"#,
+            )
+            .unwrap()
+            .unwrap();
+        let d2 = adapter
+            .parse_sse_chunk(
+                r#"data: {"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"\"NYC\"}"}}"#,
+            )
+            .unwrap()
+            .unwrap();
+
+        // Simulate absorb_frame's per-slot push_bounded concatenation.
+        let mut accum = String::new();
+        accum.push_str(&start.tool_call_deltas[0].arguments);
+        accum.push_str(&d1.tool_call_deltas[0].arguments);
+        accum.push_str(&d2.tool_call_deltas[0].arguments);
+        assert_eq!(accum, r#"{"city":"NYC"}"#);
+        // And finalize — the attested Value.
+        let attested = crate::routes::normalize_tool_call_arguments(&accum);
+        assert_eq!(attested, serde_json::json!({"city": "NYC"}));
+    }
+
+    /// R15: the OTHER half of the fix — a truly zero-arg streaming
+    /// tool_use (placeholder emits `""`, no delta frames follow) must
+    /// still attest as `{}` (matching OpenAI's `"arguments":"{}"`
+    /// wire encoding and Gemini's zero-arg `functionCall`) — the
+    /// R14 goal. `normalize_tool_call_arguments("")` covers it.
+    #[test]
+    fn empty_accumulator_normalises_to_empty_object_across_providers() {
+        // Empty accumulator (Anthropic streaming zero-arg): attests {}.
+        assert_eq!(
+            crate::routes::normalize_tool_call_arguments(""),
+            serde_json::json!({})
+        );
+        // Literal "{}" (OpenAI, Gemini, non-streaming Anthropic): {}.
+        assert_eq!(
+            crate::routes::normalize_tool_call_arguments("{}"),
+            serde_json::json!({})
+        );
+        // Real args round-trip.
+        assert_eq!(
+            crate::routes::normalize_tool_call_arguments(r#"{"city":"NYC"}"#),
+            serde_json::json!({"city": "NYC"})
+        );
+        // Corrupt bytes fall back to `{"raw": …}` (never a panic).
+        let attested = crate::routes::normalize_tool_call_arguments("{not json");
+        assert_eq!(attested["raw"], "{not json");
+    }
+}
