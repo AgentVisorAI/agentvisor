@@ -1,0 +1,500 @@
+#!/usr/bin/env node
+/*
+ * Standalone AgentVisor receipt verifier.
+ *
+ * Reads a receipt bundle exported from the console (Download receipt
+ * button on the session detail page) OR a raw daemon receipt file
+ * (spool/atif/receipts/*.json as written by agentvisord) and verifies
+ * the Ed25519 signature against the embedded public key.
+ *
+ * Requires only Node 16+. No AgentVisor dependency, no network
+ * call — everything the verifier needs is inside the JSON file
+ * (plus the trust-anchor list this script ships with).
+ *
+ * Usage:
+ *   node server/scripts/verify-receipt.mjs path/to/agentvisor-receipt-<sessId>.json
+ *   node server/scripts/verify-receipt.mjs --allow-untrusted-key <bundle.json>
+ *
+ * Exit codes:
+ *   0 — signature verifies AND the pubkey is on the trust anchor list
+ *       (or --allow-untrusted-key was passed, in which case only the
+ *       signature-vs-pubkey check must pass)
+ *   1 — signature does NOT verify (tampered or wrong pubkey)
+ *   2 — malformed bundle, OR signature verifies but the pubkey is
+ *       NOT on the trust anchor list and --allow-untrusted-key was
+ *       not passed. This case is a UI/CI distinction from "tamper" —
+ *       it's the "self-signed by an untrusted party" attack:
+ *       the attacker generated their own Ed25519 keypair, signed
+ *       arbitrary contents, and embedded their pubkey. The signature
+ *       math checks out; the AUTHORSHIP claim does not.
+ *   3 — signature verifies but the signer is the PUBLIC DEMO key
+ *       (its private half ships with the demo console, so anyone can
+ *       sign anything with it). Proves the demo flow end-to-end; is
+ *       never a production attestation. Takes precedence over
+ *       --allow-untrusted-key: scripts must not be able to launder
+ *       a demo signature into exit 0.
+ *
+ * You can safely email this file + a receipt JSON to an auditor,
+ * insurer, or opposing counsel — no proprietary code required.
+ */
+import { readFileSync } from "node:fs";
+import { createPublicKey, verify, createHash } from "node:crypto";
+
+// R78 HIGH #1: trust anchor pinning. Without this, an attacker who
+// generates their own Ed25519 keypair, signs any `rawBody`, and
+// embeds their pubkey in a fresh bundle passes the internal
+// signature check with an "authentic" verdict — the entire premise
+// of "any auditor can verify offline" collapses. Populate with
+// lowercased 64-hex Ed25519 pubkeys of the AgentVisor deployment(s).
+// Empty list defaults to REQUIRING `--allow-untrusted-key`.
+const TRUSTED_RECEIPT_KEYS = new Set([
+  // Keep in sync with docs/verify/verify.js TRUSTED_RECEIPT_KEYS.
+  // Sample receipt signing key (docs/verify/sample-receipt.json).
+  // Generated once at re-signing time; private half discarded.
+  "f85ae0090441c9ddaaaeec5e8483e28b7a48521d782117a69c0c17dacc2e6d65",
+  // Demo console signing key (docs/app/datasource.js fixed keypair).
+  "573c8f249012fbb08b3d79973411bb93141f32719c86ada25306fde5e59e8d57",
+]);
+
+// Keys whose PRIVATE half is public by design (the demo console ships
+// its signing key in docs/app/datasource.js so the mock flow works
+// offline). A signature from one of these proves only that the bundle
+// came from the demo tooling — or from anyone who copied the shipped
+// key — so it must NEVER earn the "authentic" verdict. Keep in sync
+// with docs/verify/verify.js DEMO_RECEIPT_KEYS.
+const DEMO_RECEIPT_KEYS = new Set([
+  "573c8f249012fbb08b3d79973411bb93141f32719c86ada25306fde5e59e8d57",
+]);
+
+const argv = process.argv.slice(2);
+let allowUntrusted = false;
+const files = [];
+for (const a of argv) {
+  if (a === "--allow-untrusted-key") {
+    allowUntrusted = true;
+  } else if (a.startsWith("-")) {
+    console.error("unknown flag:", a);
+    console.error("usage: verify-receipt.mjs [--allow-untrusted-key] <bundle.json>");
+    process.exit(2);
+  } else {
+    files.push(a);
+  }
+}
+if (files.length !== 1) {
+  console.error("usage: verify-receipt.mjs [--allow-untrusted-key] <bundle.json>");
+  process.exit(2);
+}
+
+let bundle;
+let rawText;
+try {
+  rawText = readFileSync(files[0], "utf8");
+  bundle = JSON.parse(rawText);
+} catch (e) {
+  console.error("Could not read/parse:", files[0], "-", e.message);
+  process.exit(2);
+}
+
+// Raw daemon receipts: the file agentvisord writes under
+// spool/atif/receipts/ is {receipt fields…, public_key_b64,
+// signature_b64} — NOT the console-export bundle envelope. The
+// /verify page (docs/verify/verify.js) and `avctl receipt-verify`
+// both accept raw files, and the page's no-WebCrypto fallback copy
+// points here — so adapt raw receipts to the bundle shape the rest
+// of this script expects. The signed message is the RFC 8785 (JCS)
+// canonicalization of the receipt WITHOUT signature_b64 (same
+// construction as av_receipts::canonicalize over Receipt.body).
+// Keep in sync with docs/verify/verify.js rawReceiptToBundle.
+function jcsCanonicalize(value) {
+  // Minimal JCS for the receipt value domain: JSON.stringify already
+  // emits shortest-form numbers for the integers/floats a receipt
+  // carries; JCS then only requires lexicographically sorted object
+  // keys (UTF-16 code-unit order — JS default sort) and no whitespace.
+  if (value === null || typeof value !== "object") return JSON.stringify(value);
+  if (Array.isArray(value)) return "[" + value.map(jcsCanonicalize).join(",") + "]";
+  const keys = Object.keys(value).sort();
+  return "{" + keys.map((k) => JSON.stringify(k) + ":" + jcsCanonicalize(value[k])).join(",") + "}";
+}
+function looksLikeRawReceipt(parsed) {
+  return (
+    parsed && typeof parsed === "object" && !parsed.format &&
+    typeof parsed.signature_b64 === "string" &&
+    typeof parsed.public_key_b64 === "string" &&
+    typeof parsed.receipt_id === "string"
+  );
+}
+if (looksLikeRawReceipt(bundle)) {
+  // Raw path: both this script and the Rust toolchain read the SAME
+  // bytes — enforce Rust's duplicate-key and strict-base64 refusals
+  // (defined below) so the two verifiers can never split verdicts.
+  const dup = firstDuplicateKey(rawText);
+  if (dup !== null) {
+    console.error(`duplicate JSON key "${dup}" — the Rust verifier refuses this file; refusing here too`);
+    process.exit(1);
+  }
+  const unsafeInt = firstUnsafeInteger(rawText);
+  if (unsafeInt !== null) {
+    console.error(`integer ${unsafeInt} exceeds 2^53 (JCS-safe bound) — JSON.parse would silently round it; the Rust verifier refuses this file; refusing here too`);
+    process.exit(1);
+  }
+  if (!isStrictStandardB64(bundle.public_key_b64)) {
+    console.error("public_key_b64 is not strict standard base64 — the Rust verifier refuses this file; refusing here too");
+    process.exit(1);
+  }
+  const body = Object.create(null);
+  for (const k of Object.keys(bundle)) {
+    if (k === "signature_b64") continue;
+    // Null-prototype target: on a plain `{}`, assigning the key
+    // "__proto__" invokes the prototype setter instead of creating an
+    // own property — the member silently VANISHES from the
+    // canonicalization (so the original signature still verifies over
+    // a body that visibly carries an extra field) and the assigned
+    // object pollutes the reconstruction's prototype. Rust refuses
+    // unknown top-level fields outright; with a null prototype the
+    // member survives into the canonical bytes and the signature
+    // check refuses it here too. Keep in sync with
+    // docs/verify/verify.js rawReceiptToBundle.
+    body[k] = bundle[k];
+  }
+  bundle = {
+    format: "agentvisor.receipt.v1",
+    receipt: { rawBody: jcsCanonicalize(body), rawSignatureB64: bundle.signature_b64 },
+    publicKey: { hex: Buffer.from(bundle.public_key_b64, "base64").toString("hex") },
+  };
+}
+
+if (bundle.format !== "agentvisor.receipt.v1") {
+  console.error("Unrecognized format:", bundle.format);
+  process.exit(2);
+}
+const r = bundle.receipt;
+const pub = bundle.publicKey;
+if (!r || !pub) {
+  console.error("Bundle missing receipt or publicKey");
+  process.exit(2);
+}
+
+const missing = ["rawBody", "rawSignatureB64"].filter((k) => !r[k]);
+if (missing.length) {
+  console.error("Receipt missing:", missing.join(", "));
+  process.exit(2);
+}
+
+const pubKeyHex = pub.hex;
+if (!/^[0-9a-fA-F]{64}$/.test(pubKeyHex)) {
+  console.error("Public key hex must be 64 chars (32 bytes)");
+  process.exit(2);
+}
+const pubBytes = Buffer.from(pubKeyHex, "hex");
+// Ed25519 raw pubkey -> DER SPKI so createPublicKey can consume it.
+// SPKI prefix for Ed25519: 302a300506032b6570032100 (12 bytes) + 32
+// bytes of raw key = 44-byte DER.
+const spki = Buffer.concat([
+  Buffer.from("302a300506032b6570032100", "hex"),
+  pubBytes,
+]);
+const key = createPublicKey({ key: spki, format: "der", type: "spki" });
+
+// R190 F1: match the Rust `av-receipts` signing framing.
+// crates/av-receipts/src/receipt.rs:50-64 `signing_message()`
+// dispatches on `receipt_version`:
+//   v1 → bare canonical bytes (legacy)
+//   v2 → RECEIPT_DOMAIN_TAG_V2 (b"agentvisor-receipt-v2\0") ||
+//        u64_be(canonical.len()) || canonical
+// Rust defaults RECEIPT_VERSION=2 (receipt.rs:30), so modern
+// daemons emit v2 receipts. Prior CLI used bare-body semantics
+// only and would fail every v2 receipt as "SIGNATURE DOES NOT
+// VERIFY" (exit 1) even though the sig was cryptographically
+// valid. Now: parse body, dispatch to correct framing.
+const RECEIPT_DOMAIN_TAG_V2 = Buffer.from("agentvisor-receipt-v2\0", "utf8");
+function receiptSigningMessage(rawBody) {
+  const canonical = Buffer.from(rawBody, "utf8");
+  let receiptVersion = 1;
+  try {
+    const parsed = JSON.parse(rawBody);
+    if (typeof parsed.receipt_version === "number") receiptVersion = parsed.receipt_version;
+  } catch { /* body not JSON — leave as v1 */ }
+  if (receiptVersion === 1) return canonical;
+  if (receiptVersion === 2) {
+    const lenBuf = Buffer.alloc(8);
+    lenBuf.writeBigUInt64BE(BigInt(canonical.length), 0);
+    return Buffer.concat([RECEIPT_DOMAIN_TAG_V2, lenBuf, canonical]);
+  }
+  // Unknown version: hard refusal BEFORE any cryptographic check. The
+  // previous "return empty buffer" sentinel was not fail-closed — the
+  // empty message is perfectly valid Ed25519 signing input, so any
+  // key that ever signed zero bytes in another context would make
+  // every version-3+ body "verify". Rust refuses unsupported versions
+  // outright (receipt.rs signing_message); mirror it.
+  console.error(
+    `receipt_version ${receiptVersion} has no defined signature framing (supported: 1, 2) — the Rust verifier refuses this file; refusing here too`,
+  );
+  process.exit(1);
+}
+// Rust-parity strictness (round-12 differential: one file must never
+// verify green here while `avctl receipt-verify` / the daemon refuse
+// it — an equivocation vector for whoever holds the "greener" tool):
+//   1. STANDARD base64 alphabet only, correct padding, no whitespace.
+//      Node's Buffer.from(s, "base64") is WHATWG-forgiving (skips
+//      whitespace and invalid chars); Rust's strict decoder refuses.
+//   2. Duplicate JSON keys at any nesting level are refused — Rust
+//      reject_duplicate_keys does (RFC 8259 leaves dup handling
+//      implementation-defined; JSON.parse silently keeps the LAST,
+//      so two readers can disagree about the signed content).
+function isStrictStandardB64(s) {
+  if (typeof s !== "string" || s.length % 4 !== 0 || !/^[A-Za-z0-9+/]*={0,2}$/.test(s)) return false;
+  // Canonical-encoding parity: non-zero trailing bits (and odd padding
+  // shapes) decode identically under Buffer.from(s, "base64") but Rust's
+  // STANDARD engine refuses them. Round-tripping decode→encode accepts
+  // exactly the canonical encodings. Keep in sync with
+  // docs/verify/verify.js.
+  return Buffer.from(s, "base64").toString("base64") === s;
+}
+// Rust-parity precision gate: receipt integers are u64s capped at
+// JCS_SAFE_MAX = 2^53 (av-core error.rs; jcs.rs refuses anything
+// above). JSON.parse rounds bigger integer tokens to the nearest
+// double BEFORE this script re-canonicalizes the raw-receipt body, so
+// a tampered `…992` → `…993` silently rounds BACK to the signed value
+// and verified green here while `avctl receipt-verify` refuses the
+// file — the same one-file-two-verdicts equivocation the duplicate-key
+// and base64 gates close. Scan the raw text: any integer token above
+// 2^53 in magnitude is a refusal. Keep in sync with
+// docs/verify/verify.js.
+function firstUnsafeInteger(text) {
+  const LIMIT = 9007199254740992n; // 2^53 == Rust JCS_SAFE_MAX
+  let i = 0;
+  const n = text.length;
+  while (i < n) {
+    const c = text[i];
+    if (c === '"') {
+      i++;
+      while (i < n) {
+        if (text[i] === "\\") { i += 2; continue; }
+        if (text[i] === '"') { i++; break; }
+        i++;
+      }
+      continue;
+    }
+    if (c === "-" || (c >= "0" && c <= "9")) {
+      let j = i;
+      if (text[j] === "-") j++;
+      let digits = "";
+      while (j < n && text[j] >= "0" && text[j] <= "9") { digits += text[j]; j++; }
+      const isFloat = text[j] === "." || text[j] === "e" || text[j] === "E";
+      if (!isFloat && digits.length > 0 && BigInt(digits) > LIMIT) {
+        return (text[i] === "-" ? "-" : "") + digits;
+      }
+      // Skip any float tail so its digits aren't re-scanned.
+      while (j < n && /[0-9eE+.-]/.test(text[j])) j++;
+      i = j;
+      continue;
+    }
+    i++;
+  }
+  return null;
+}
+function firstDuplicateKey(text) {
+  // Minimal JSON walker: tracks object key sets per depth. Assumes
+  // `text` already survived JSON.parse (called only on parseable input).
+  let i = 0;
+  const stack = [];
+  const n = text.length;
+  function skipWs() { while (i < n && /[ \t\n\r]/.test(text[i])) i++; }
+  function readString() {
+    // at opening quote
+    i++;
+    const start = i;
+    while (i < n) {
+      if (text[i] === "\\") { i += 2; continue; }
+      if (text[i] === '"') {
+        const raw = text.slice(start, i);
+        i++;
+        // Decode JSON string escapes so duplicate detection happens in
+        // the same domain as serde's decoded-key comparison:
+        // "\u0073ession_id" and "session_id" are the SAME key to the
+        // Rust verifier and must collide here too — comparing raw
+        // escape text let an escaped duplicate slip past this gate
+        // while JSON.parse silently kept the last value. Keep in sync
+        // with docs/verify/verify.js.
+        try { return JSON.parse('"' + raw + '"'); } catch { return raw; }
+      }
+      i++;
+    }
+    return text.slice(start);
+  }
+  while (i < n) {
+    skipWs();
+    const c = text[i];
+    if (c === "{") { stack.push({ keys: new Set(), expectKey: true }); i++; continue; }
+    if (c === "}") { stack.pop(); i++; continue; }
+    if (c === "[") { stack.push(null); i++; continue; }
+    if (c === "]") { stack.pop(); i++; continue; }
+    if (c === '"') {
+      const s = readString();
+      skipWs();
+      const top = stack[stack.length - 1];
+      if (top && top.expectKey && text[i] === ":") {
+        if (top.keys.has(s)) return s;
+        top.keys.add(s);
+      }
+      continue;
+    }
+    if (c === ",") {
+      const top = stack[stack.length - 1];
+      if (top) top.expectKey = true;
+      i++;
+      continue;
+    }
+    if (c === ":") { const top = stack[stack.length - 1]; if (top) top.expectKey = false; i++; continue; }
+    i++;
+  }
+  return null;
+}
+
+const msg = receiptSigningMessage(r.rawBody);
+if (!isStrictStandardB64(r.rawSignatureB64)) {
+  console.error("signature_b64 is not strict standard base64 (URL-safe chars, whitespace, or bad padding) — the Rust verifier refuses this file; refusing here too");
+  process.exit(1);
+}
+const sig = Buffer.from(r.rawSignatureB64, "base64");
+
+const sigOk = verify(null, msg, key, sig);
+// R193 F1: enforce identity binding — body.key_id must derive
+// from the pubkey. Mirrors Rust `Receipt::verify_embedded()` at
+// crates/av-receipts/src/receipt.rs:371-374. Legacy v1 receipts
+// (sample-receipt.json) have no body.key_id — skip.
+function deriveKeyIdFromPubHex(hex) {
+  return createHash("sha256").update(Buffer.from(hex, "hex")).digest("hex").slice(0, 32);
+}
+let keyIdOk = true;
+let pubkeyOk = true;
+let bodyKeyId = null;
+if (sigOk) {
+  try {
+    const parsed = JSON.parse(r.rawBody);
+    if (typeof parsed.key_id === "string" && parsed.key_id.length > 0) {
+      bodyKeyId = parsed.key_id.toLowerCase();
+      const derived = deriveKeyIdFromPubHex(pubKeyHex.toLowerCase());
+      if (derived !== bodyKeyId) keyIdOk = false;
+    }
+    // R199 F1: enforce body.public_key_b64 ↔ bundle pubkey binding.
+    // See docs/verify/verify.js for full rationale.
+    if (typeof parsed.public_key_b64 === "string" && parsed.public_key_b64.length > 0) {
+      try {
+        const bodyPubBytes = Buffer.from(parsed.public_key_b64, "base64");
+        const bundlePubBytes = Buffer.from(pubKeyHex, "hex");
+        if (bodyPubBytes.length !== bundlePubBytes.length ||
+            !bodyPubBytes.equals(bundlePubBytes)) {
+          pubkeyOk = false;
+        }
+      } catch { pubkeyOk = false; }
+    }
+  } catch { /* body not JSON — leave keyIdOk + pubkeyOk true */ }
+}
+const ok = sigOk && keyIdOk && pubkeyOk;
+const demoKey = ok && DEMO_RECEIPT_KEYS.has(pubKeyHex.toLowerCase());
+const trustedKey = ok && !demoKey && TRUSTED_RECEIPT_KEYS.has(pubKeyHex.toLowerCase());
+
+// Metadata rows. R8-claim-audit parity with docs/verify/verify.js:
+// display facts from the SIGNED body first — the bundle envelope's
+// `session` / `eventCount` / `receiptId` duplicates are convenience
+// copies an attacker can edit freely WITHOUT breaking the signature,
+// so printing them above the "authentic" verdict let a tampered
+// bundle show forged session ids, agents, and counts. Envelope values
+// are last-resort fallbacks only, and any drift between an envelope
+// copy and its signed counterpart is called out explicitly.
+// Console-export bodies use camelCase (sessionExternalId/agent/
+// eventCount/receiptId); raw daemon receipt bodies use the Rust wire
+// shape (session_id, ai_agent.charter.name, subject.event_count/
+// step_count, receipt_id). Accept both.
+let signedBody = {};
+try { signedBody = JSON.parse(r.rawBody || "{}"); } catch { signedBody = {}; }
+const rawSubject = signedBody.subject || {};
+const envSession = bundle.session || {};
+// Values that only exist in the unsigned envelope are labeled as such
+// inline — an auditor must never mistake attacker-editable convenience
+// copies for signed facts.
+const unsignedTag = (v) => `${v} (unsigned envelope value — NOT covered by the signature)`;
+const sessionRow =
+  signedBody.sessionExternalId || signedBody.sessionId || signedBody.session_id ||
+  (envSession.externalId ? unsignedTag(envSession.externalId) : envSession.id ? unsignedTag(envSession.id) : "—");
+const agentRow =
+  signedBody.agent || signedBody.ai_agent?.charter?.name ||
+  (envSession.agent ? unsignedTag(envSession.agent) : "—");
+const eventsRow =
+  signedBody.eventCount ?? rawSubject.event_count ?? rawSubject.step_count ??
+  (r.eventCount != null ? unsignedTag(r.eventCount) : "—");
+const receiptIdRow =
+  signedBody.receiptId || signedBody.receipt_id ||
+  (r.receiptId ? unsignedTag(r.receiptId) : "—");
+console.log("Session:       ", sessionRow);
+console.log("Agent:         ", agentRow);
+console.log("Events sealed: ", eventsRow);
+console.log("Receipt ID:    ", receiptIdRow);
+console.log("Public key:    ", pubKeyHex);
+console.log("Trusted key:   ", trustedKey ? "yes" : "NO (not on the trust anchor list)");
+console.log("Message bytes: ", msg.length);
+console.log("Signature:     ", sig.length + " bytes (Ed25519)");
+const drift = [];
+if (envSession.externalId && signedBody.sessionExternalId && envSession.externalId !== signedBody.sessionExternalId) drift.push("session id");
+if (envSession.agent && signedBody.agent && envSession.agent !== signedBody.agent) drift.push("agent");
+if (r.eventCount != null && signedBody.eventCount != null && r.eventCount !== signedBody.eventCount) drift.push("event count");
+if (r.receiptId && signedBody.receiptId && r.receiptId !== signedBody.receiptId) drift.push("receipt id");
+if (drift.length > 0) {
+  console.log(`⚠️  Unsigned envelope copies differ from the signed body: ${drift.join(", ")} — trust the signed values above.`);
+}
+console.log("");
+
+if (!ok) {
+  console.log("❌ SIGNATURE DOES NOT VERIFY — bundle has been tampered with or the public key is wrong.");
+  process.exit(1);
+}
+
+if (trustedKey) {
+  console.log("✅ SIGNATURE VERIFIES against a TRUSTED key — this session record is authentic.");
+  process.exit(0);
+}
+
+if (demoKey) {
+  console.log(
+    "🧪 DEMO RECEIPT — signed by the public demo key. That key's PRIVATE half ships with the\n" +
+    "   demo console, so anyone can sign anything with it. This proves the demo flow end-to-end\n" +
+    "   but is NOT a production attestation.",
+  );
+  // Distinct from both "authentic" (0) and "tampered" (1): scripts
+  // must be able to require the production verdict.
+  process.exit(3);
+}
+
+if (allowUntrusted) {
+  console.log(
+    "⚠️  SIGNATURE IS INTERNALLY CONSISTENT — but the public key is NOT on the trust anchor list.",
+  );
+  console.log(
+    "   `--allow-untrusted-key` was passed, so exiting 0. The bundle attests only that WHOEVER",
+  );
+  console.log(
+    "   holds the corresponding private key signed this payload — NOT that it was AgentVisor.",
+  );
+  process.exit(0);
+}
+
+console.log(
+  "⚠️  SIGNATURE IS INTERNALLY CONSISTENT — but the public key is NOT on the trust anchor list.",
+);
+console.log(
+  "   The signature math checks out AGAINST THE PUBLIC KEY IN THE BUNDLE, but that key is not",
+);
+console.log(
+  "   one this verifier is willing to trust. An attacker who generates their own Ed25519 keypair",
+);
+console.log(
+  "   can produce identical output, so this is NOT proof of AgentVisor authorship. Rerun with",
+);
+console.log(
+  "   `--allow-untrusted-key` to acknowledge and exit 0, or populate TRUSTED_RECEIPT_KEYS with",
+);
+console.log(
+  "   the deployment's canonical Ed25519 pubkey and rerun.",
+);
+process.exit(2);

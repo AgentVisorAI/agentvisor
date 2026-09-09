@@ -1,0 +1,138 @@
+[package]
+name = "av-bridge"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Portable event bridge: EventBus trait, embedded file-backed broker, manifest provisioning"
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+av-core = { workspace = true }
+av-events = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = { workspace = true }
+thiserror = { workspace = true }
+parking_lot = { workspace = true }
+tracing = { workspace = true }
+jsonschema = { workspace = true }
+
+[features]
+default = []
+# Two-phase authenticated cold-tier archive (object_store-backed).
+cold-store = [
+    "dep:object_store",
+    "dep:url",
+    "dep:hmac",
+    "dep:sha2",
+    "dep:hex",
+    "dep:av-receipts",
+    "dep:tokio",
+    "dep:futures",
+]
+# NATS JetStream connector (edge/single-node alternative, brief Module F).
+nats = [
+    "dep:async-nats",
+    "dep:rustls-tls",
+    "dep:tokio",
+    "dep:futures",
+    "cold-store",
+]
+# Kafka-wire connector (works against Redpanda, brief's reference broker).
+kafka = [
+    "dep:rskafka",
+    "dep:rdkafka",
+    "dep:rustls-tls",
+    "dep:rustls-pki-types",
+    "dep:tokio",
+    "dep:chrono",
+    "cold-store",
+]
+# S3-compatible cold-tier targets (`s3://` cold_uri; AWS_* env credentials).
+cold-store-aws = ["cold-store", "object_store/aws"]
+
+[dependencies.async-nats]
+version = "0.50"
+optional = true
+
+[dependencies.rskafka]
+version = "0.6"
+optional = true
+features = ["transport-tls"]
+
+# rskafka 0.6 and async-nats share the rustls 0.23 line; `rustls-tls` is
+# the workspace-wide client-config surface for both connectors. PEM
+# parsing comes from rustls-pki-types (rustls-pemfile is archived,
+# RUSTSEC-2025-0134).
+[dependencies.rustls-tls]
+package = "rustls"
+version = "0.23"
+optional = true
+default-features = false
+features = ["ring", "std", "tls12"]
+
+[dependencies.rustls-pki-types]
+version = "1.9"
+optional = true
+
+[dependencies.rdkafka]
+workspace = true
+optional = true
+
+[dependencies.chrono]
+version = "0.4"
+optional = true
+default-features = false
+features = ["clock"]
+
+[dependencies.tokio]
+workspace = true
+optional = true
+
+[dependencies.futures]
+workspace = true
+optional = true
+
+[dependencies.object_store]
+workspace = true
+optional = true
+features = ["fs"]
+
+[dependencies.url]
+workspace = true
+optional = true
+
+[dependencies.hmac]
+workspace = true
+optional = true
+
+[dependencies.sha2]
+workspace = true
+optional = true
+
+[dependencies.hex]
+workspace = true
+optional = true
+
+[dependencies.av-receipts]
+workspace = true
+optional = true
+
+[dev-dependencies]
+tempfile = { workspace = true }
+proptest = { workspace = true }
+
+# Live S3 cold-tier contract (tests/cold_store_live.rs, AV_COLD_S3_URL-gated)
+# reads exported objects back directly. Feature-unification also gives the
+# library's `parse_url_opts` s3:// support inside test builds.
+[dev-dependencies.object_store]
+workspace = true
+features = ["fs", "aws"]
+
+[lints]
+workspace = true
