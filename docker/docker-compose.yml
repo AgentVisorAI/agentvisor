@@ -1,0 +1,300 @@
+services:
+  install-secrets:
+    # Plain Compose implements file secrets as bind mounts and ignores their
+    # uid/gid/mode fields. Copy them into a dedicated private volume so the
+    # non-root daemon can read them without weakening its permission checks.
+    image: alpine@sha256:294b683cb724975bec92580e1e685676bd4b50bda910ddb8c51d4cabeaec77e6
+    user: "0:0"
+    network_mode: none
+    read_only: true
+    security_opt:
+      - "no-new-privileges:true"
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - FOWNER
+      - DAC_OVERRIDE
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - |
+        umask 077
+        for name in identity_hmac signing_seed; do
+          source="/run/secrets/$$name"
+          mode=$$(stat -c '%a' "$$source")
+          if [ $$((0$$mode & 077)) -ne 0 ]; then
+            echo "Secret $$name must be owner-only on the host (chmod 0600)." >&2
+            exit 1
+          fi
+          [ -s "$$source" ] || { echo "Secret $$name is empty." >&2; exit 1; }
+          cp "$$source" "/prepared-secrets/.$$name.tmp"
+          chown 65532:65532 "/prepared-secrets/.$$name.tmp"
+          chmod 0400 "/prepared-secrets/.$$name.tmp"
+          mv -f "/prepared-secrets/.$$name.tmp" "/prepared-secrets/$$name"
+        done
+        chown 65532:65532 /prepared-secrets
+        chmod 0700 /prepared-secrets
+    secrets:
+      - identity_hmac
+      - signing_seed
+    volumes:
+      - runtime-secrets:/prepared-secrets
+
+  agentvisor-ai:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    image: agentvisor-ai:local
+    container_name: agentvisor-ai
+    ports:
+      # Keep the published gateway local. The full configuration requires
+      # identity; configure its issuer and audience before exposing it through
+      # an authenticated ingress. A bare "8484:8484" publishes every interface.
+      - "127.0.0.1:8484:8484"
+    # Docker's default stop_grace_period is 10 s — far shorter than the
+    # harness's four shutdown phases (HTTP drain, worker wait_idle,
+    # finalize_sessions, telemetry flush). This service loads
+    # config/harness.docker.toml, which sets shutdown_drain_timeout_s
+    # = 110 (to fit the 300 s upstream_read_timeout_s streaming
+    # window). Total worst-case budget: 110 (HTTP drain) + 30 (worker
+    # wait_idle) + 30 (finalize_sessions) + 5 (OTel) = 175 s. Without
+    # this override, or with the previous 120 s value which the
+    # earlier comment miscomputed as "30 s each × 3 + 5 = 95 s",
+    # docker stop / docker compose down sent SIGKILL mid-finalize,
+    # dropping receipts and truncating ATIF trajectories. 180 s
+    # leaves a small safety margin.
+    stop_grace_period: 180s
+    # Round-24 F2: pair the systemd-side Restart=on-failure hardening
+    # (round-19 F7) with a compose-side policy. Without this, a single
+    # OOMKill leaves agentvisor-ai Exited with no healthcheck consulted
+    # and no alert path. Use `unless-stopped` so `docker compose down`
+    # still works predictably (as opposed to `always`).
+    restart: unless-stopped
+    # Match the Kubernetes securityContext: no fresh privileges after fork,
+    # drop every Linux capability, and cap process/memory footprint so a
+    # runaway or compromised worker cannot starve the host.
+    security_opt:
+      - "no-new-privileges:true"
+    cap_drop:
+      - ALL
+    pids_limit: 4096
+    read_only: false # /app/data and /app/spool are writable named volumes
+    environment:
+      RUST_LOG: info
+      AV_CONFIG: /app/config/harness.docker.toml
+      # The receipt trust anchor lives in a private volume populated by
+      # install-secrets and mounted read-only, separate from bridge data.
+      AV_SIGNING_SEED_FILE: /run/secrets/signing_seed
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://vector:4318
+      OTEL_EXPORTER_OTLP_PROTOCOL: http/protobuf
+    volumes:
+      - bridge-data:/app/data
+      - atif-spool:/app/spool
+      - runtime-secrets:/run/secrets:ro
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    healthcheck:
+      # Hardcode the URL rather than relying on `avctl health`'s default
+      # matching whatever `listen` is in `config/harness.docker.toml`.
+      # A silent drift between the two used to make the healthcheck
+      # report *green* against the wrong endpoint (round-11 F8) — the
+      # `listen` port changing without the CLI default updating still
+      # returned 200 from a stale sidecar or an unrelated in-container
+      # service. Probe /readyz, not the /health constant: a full disk
+      # keeps /health green while every request 503s — readiness's
+      # spool WRITABILITY probe is what flips on that incident.
+      test: ["CMD", "avctl", "health", "--url", "http://127.0.0.1:8484/readyz"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    depends_on:
+      install-secrets:
+        condition: service_completed_successfully
+      redpanda:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      qdrant:
+        condition: service_healthy
+
+  redpanda:
+    # 26.2 is supported through July 2027; 25.2 reached EOL in July 2026.
+    # Existing 25.2 volumes need sequential 25.3 -> 26.1 -> 26.2 upgrades.
+    # See README's migration note before reusing an existing broker volume.
+    image: docker.redpanda.com/redpandadata/redpanda:v26.2.2@sha256:468bd13a9f2bd24794cb7fddc867c767fb1008b9a07b297b89fde48c564d7d96
+    # Internal-only: Kafka is consumed via the compose network as
+    # `redpanda:9092`. Binding to 127.0.0.1 keeps the external listener
+    # reachable for a local `rpk` on the host without exposing it to the
+    # host's network interfaces.
+    ports:
+      - "127.0.0.1:19092:19092"
+    restart: unless-stopped
+    command:
+      - redpanda
+      - start
+      - --overprovisioned
+      - --smp=1
+      - --memory=1G
+      - --reserve-memory=0M
+      - --node-id=0
+      - --check=false
+      - --kafka-addr=internal://0.0.0.0:9092,external://0.0.0.0:19092
+      - --advertise-kafka-addr=internal://redpanda:9092,external://127.0.0.1:19092
+    # Round-24 F3: pin the Kafka log dir onto a named volume so
+    # `docker compose down` / `docker rm` / image bumps do not destroy
+    # every signed receipt, ATIF trajectory, and lifecycle outbox the
+    # bridge has published. The compose file's whole reason to exist
+    # (over docker-compose.minimal.yml) is a durable audit trail;
+    # redis-data was already pinned, redpanda-data was missed.
+    volumes:
+      - redpanda-data:/var/lib/redpanda/data
+    healthcheck:
+      test: ["CMD-SHELL", "rpk cluster health | grep -Eq 'Healthy:[[:space:]]+true'"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+
+  redis:
+    image: redis:8.2.1-alpine
+    # Internal-only: state store is consumed via `redis://redis:6379` on the
+    # compose network. Localhost binding keeps `redis-cli` on the host
+    # working without publishing an unauthenticated Redis to the world.
+    ports:
+      - "127.0.0.1:6379:6379"
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes", "--appendfsync", "everysec"]
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+
+  qdrant:
+    image: qdrant/qdrant:v1.15.4
+    # Internal-only vector DB (see redpanda note above).
+    ports:
+      - "127.0.0.1:6333:6333"
+    restart: unless-stopped
+    volumes:
+      - qdrant-data:/qdrant/storage
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c ':> /dev/tcp/127.0.0.1/6333'"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+
+  minio:
+    # The community MinIO images were withdrawn from Docker Hub (minio/minio
+    # now answers 404), so this fixture uses Chainguard's maintained build of
+    # the MinIO server, pinned by index digest. It is only for local S3
+    # contract tests. Production cold storage must use a maintained
+    # S3-compatible service.
+    profiles: ["local-test"]
+    image: cgr.dev/chainguard/minio@sha256:bd014394a80898e68c149f2311fdf8d5a2c2f3bb2c33b9327ae6d02b4b065ae1
+    # Internal-only S3-compatible object store for the cold tier
+    # (`cold_uri = "s3://..."`). Used by CI's live cold-store contract
+    # test (`AV_COLD_S3_URL`); the entrypoint pre-creates the bucket so
+    # the conditional-put export path needs no client-side setup.
+    ports:
+      # Host 9100: port 9000 is commonly occupied on dev hosts.
+      - "127.0.0.1:9100:9000"
+    restart: unless-stopped
+    environment:
+      MINIO_ROOT_USER: agentvisor
+      MINIO_ROOT_PASSWORD: agentvisor-ci-secret
+      # The image has no curl; its bundled MinIO client checks readiness.
+      MC_HOST_local: http://agentvisor:agentvisor-ci-secret@127.0.0.1:9000
+    entrypoint: ["/bin/sh", "-c", "mkdir -p /data/agentvisor-cold && exec minio server /data"]
+    volumes:
+      - minio-data:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+
+  nats:
+    # 2.11 no longer receives patches; 2.15 is a maintained release line.
+    image: nats:2.15.0-alpine@sha256:ac8f88a6494bffc2c2a5289a0ca61cb28a9145c11ba5677cf24265d07f46d8d4
+    # Internal-only JetStream bus.
+    ports:
+      - "127.0.0.1:4222:4222"
+    restart: unless-stopped
+    # Round-24 F3: pin JetStream state to a named volume with `-sd`
+    # so the audit-trail bus (when bridge_backend = "nats") is not
+    # destroyed on container restart. `-js` alone stores JetStream in
+    # a randomly-named tmp dir under /tmp on some images and in
+    # /data on others; being explicit removes that ambiguity.
+    command: ["-js", "-sd", "/data", "-m", "8222"]
+    volumes:
+      - nats-data:/data
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8222/healthz"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+
+  vector:
+    image: timberio/vector:0.48.0-debian
+    # Internal-only OTLP receivers; agentvisor-ai sends via the compose network.
+    ports:
+      - "127.0.0.1:4317:4317"
+      - "127.0.0.1:4318:4318"
+    restart: unless-stopped
+    volumes:
+      - ./vector.toml:/etc/vector/vector.toml:ro
+      # Round-24 F1: the docker socket was previously mounted read-only
+      # for the docker_logs source. Read-only does NOT prevent Vector
+      # (or a malicious VRL transform) from calling `docker inspect` on
+      # every co-scheduled container, including agentvisor-ai, whose
+      # environment holds AV_UPSTREAM_API_KEY. The source has been
+      # switched to OTLP-only (agentvisor-ai already sends OTel logs via
+      # the compose network on 4318). If you need container-log
+      # discovery, put a docker-socket-proxy (e.g.
+      # tecnativa/docker-socket-proxy) in front and remount ONLY the
+      # proxy's socket into Vector — never the raw docker.sock.
+      # - /var/run/docker.sock:/var/run/docker.sock:ro
+
+volumes:
+  # Private copies owned by UID 65532, never mounted into backing services.
+  # Source files remain the authority and are copied on every Compose startup.
+  runtime-secrets:
+  bridge-data:
+  atif-spool:
+  qdrant-data:
+  redis-data:
+  minio-data:
+  # Round-24 F3: persistent home for the audit-trail buses.
+  redpanda-data:
+  nats-data:
+
+secrets:
+  # File-backed secrets: the prior `external: true` shape was
+  # SWARM-ONLY — plain `docker compose up` (the mode every other key
+  # in this file targets: build:, container_name:, pids_limit:,
+  # extra_hosts: are all ignored or rejected by `docker stack
+  # deploy`) failed at container creation with "unsupported external
+  # secret identity_hmac", so the daemon service never started while
+  # every backing service came up. `docker compose config` exits 0 on
+  # that shape, which is why the CI config check never noticed.
+  #
+  # The committed files are all-zero PLACEHOLDERS: the daemon's
+  # weak-material refusal rejects them at boot (fail-closed, loud),
+  # forcing the operator to generate real ones:
+  #   openssl rand -hex 32 > docker/secrets/identity_hmac
+  #   openssl rand -hex 32 > docker/secrets/signing.seed
+  #   chmod 0400 docker/secrets/*
+  # (Both files are read as text: the signing seed MUST be 64 hex
+  # chars — the loader hex-decodes it — and the HMAC secret is used
+  # verbatim, so hex text works for both and survives editors.)
+  # Compose preserves HOST ownership/mode for file-backed secrets. The
+  # install-secrets service checks owner-only permissions, then makes private
+  # UID-65532 copies. The daemon mounts only those copies, read-only. Protect
+  # and back up the source signing seed; never replace it on routine restarts.
+  identity_hmac:
+    file: ./secrets/identity_hmac
+  # Round-16 F3: the signing seed IS the receipt trust anchor.
+  signing_seed:
+    file: ./secrets/signing.seed
